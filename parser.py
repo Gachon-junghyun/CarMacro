@@ -142,9 +142,11 @@ def parse_vertical(path):
 
     v, _ = get("생년월일")
     if v:
-        b6 = _birth6(v)
-        if b6:
-            mapped["birth1"] = b6
+        d8 = _date_norm(v)   # 1978-06-11 / 1982.3.22 → YYYY-MM-DD
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", d8):
+            mapped["birth1"] = d8
+        elif _birth6(v):
+            mapped["birth1"] = _birth6(v)   # 6자리만 있으면 그대로
         else:
             handoff.append(("생년월일", v, "형식 불명 → 직접 확인"))
 

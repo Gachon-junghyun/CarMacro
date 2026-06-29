@@ -54,6 +54,9 @@ FIELDS = [
 FIELD_BY_ID = {f["id"]: f for f in FIELDS}
 KNOWN_COLS = set(FIELD_BY_ID) | {"local_nm"}  # local_nm = (선택) 지자체 일치 확인용
 
+# 폼에 원하는 값이 없을 때 대체값 (예: 수소엔 개인사업자(B)가 없어 개인(P)로)
+SELECT_FALLBACK = {"req_kind": {"B": "P"}}
+
 MOBILE_RE = re.compile(r"^01[016789]-?\d{3,4}-?\d{4}$")
 BIRTH6_RE = re.compile(r"^\d{6}$")
 RRN_RE = re.compile(r"^\d{6}-?\d{7}$")
@@ -457,6 +460,13 @@ def fill_one(driver, row, log=None):
             fill_text(driver, fid, v)
         elif f["kind"] == "select":
             st = select_value(driver, fid, v)
+            if st == "missing":
+                fb = SELECT_FALLBACK.get(fid, {}).get(str(v))
+                if fb and select_value(driver, fid, fb) == "ok":
+                    row[fid] = fb   # 검증도 대체값 기준으로
+                    st = "ok"
+                    if log:
+                        log(f"ℹ '{fid}' 값 '{v}' 이 폼에 없어 '{fb}'(으)로 대체 입력", color="red")
             if st == "missing" and log:
                 log(f"❌ '{fid}' 값 '{v}' 이(가) 이 폼 선택지에 없음 → 직접 확인", color="red")
             elif st == "error" and log:
