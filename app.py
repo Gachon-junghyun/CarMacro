@@ -634,6 +634,9 @@ class Worker(threading.Thread):
         try:
             opts = webdriver.ChromeOptions()
             opts.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
+            # 확인창(confirm/alert)을 드라이버가 자동으로 닫지 않게 함.
+            # (폴링 중 사용자의 "이동하시겠습니까?" 창이 자동 취소되던 문제 방지)
+            opts.set_capability("unhandledPromptBehavior", "ignore")
             self.driver = webdriver.Chrome(options=opts)
         except Exception as e:
             self.log(f"크롬 연결 실패: {e}")
