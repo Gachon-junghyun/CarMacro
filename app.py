@@ -512,7 +512,8 @@ def verify_fill(driver, row):
 
 # ── 워커 ──────────────────────────────────────────────────────
 class Worker(threading.Thread):
-    def __init__(self, rows, log_q, state_q, cmd_q, auto_flag, addr_flag):
+    def __init__(self, rows, log_q, state_q, cmd_q, auto_flag, addr_flag,
+                 code_flag, code_confirm_flag):
         super().__init__(daemon=True)
         self.rows = rows
         self.log_q = log_q
@@ -520,10 +521,14 @@ class Worker(threading.Thread):
         self.cmd_q = cmd_q
         self.auto_flag = auto_flag
         self.addr_flag = addr_flag
+        self.code_flag = code_flag            # 확인코드 자동입력 on/off
+        self.code_confirm_flag = code_confirm_flag  # 확인(저장)까지 자동 on/off
         self.idx = 0
         self.running = True
         self.driver = None
         self.blank_handled = False
+        self.main_handle = None
+        self._code_done = None                # 이미 채운 팝업 핸들
 
     def log(self, msg, color=None):
         self.log_q.put((time.strftime("[%H:%M:%S] ") + msg, color))
@@ -624,6 +629,22 @@ class Worker(threading.Thread):
             self.set_state(status="크롬 연결 실패 (포트 9222 확인)")
             return
 
+        # 작업 대상(메인 폼) 창 기억 — 보안팝업 처리 후 복귀용
+        self.main_handle = self.driver.current_window_handle
+        if not self.on_form():
+            for h in self.driver.window_handles:
+                try:
+                    self.driver.switch_to.window(h)
+                    if self.driver.current_url.endswith(URL_SUFFIX):
+                        self.main_handle = h
+                        break
+                except Exception:
+                    pass
+            try:
+                self.driver.switch_to.window(self.main_handle)
+            except Exception:
+                pass
+
         self.log(f"연결 완료. URL: {self.driver.current_url}")
         if not self.on_form():
             self.log("⚠ 지금 화면이 신청서 작성 폼이 아닙니다. 지자체 선택 후 폼으로 이동하세요.")
@@ -635,6 +656,18 @@ class Worker(threading.Thread):
         self.precheck_models()
 
         while self.running:
+            # 보안 확인코드 팝업 자동 처리(있으면) + 메인 창 복귀
+            if self.code_flag[0]:
+                try:
+                    self.handle_random_popup()
+                except Exception:
+                    pass
+            try:
+                if self.main_handle and self.driver.current_window_handle != self.main_handle:
+                    self.driver.switch_to.window(self.main_handle)
+            except Exception:
+                pass
+
             try:
                 while True:
                     cmd = self.cmd_q.get_nowait()
@@ -658,6 +691,58 @@ class Worker(threading.Thread):
                 self.do_fill("자동 감지(빈 폼)")
 
             time.sleep(0.5)
+
+    def handle_random_popup(self):
+        """보안 확인코드 팝업(popupSellerRandomChk)이 뜨면 코드 역순을 자동 입력."""
+        try:
+            handles = self.driver.window_handles
+        except Exception:
+            return
+        # 닫힌 팝업이면 가드 해제
+        if self._code_done and self._code_done not in handles:
+            self._code_done = None
+        for h in handles:
+            if h == self.main_handle:
+                continue
+            try:
+                self.driver.switch_to.window(h)
+                url = self.driver.current_url
+            except Exception:
+                continue
+            if "RandomChk" not in url and "popupSellerRandom" not in url:
+                continue
+            if self._code_done == h:
+                return  # 이미 채움(사용자 입력 덮어쓰기 방지)
+            # 화면 코드 읽기: goCompare 소스의 실제 코드를 우선(검증이 쓰는 값).
+            # 실패 시 span.guide 중 ASCII 영숫자 텍스트.
+            code = ""
+            src = self.driver.execute_script(
+                "try{return goCompare.toString()}catch(e){return ''}")
+            m = re.search(r"=\s*'([0-9A-Za-z]{6,16})'\s*\.split", src)
+            if m:
+                code = m.group(1)
+            else:
+                cands = self.driver.execute_script(
+                    "return [...document.querySelectorAll('span.guide,span,div,b')]"
+                    ".map(e=>(e.textContent||'').trim())"
+                    ".filter(t=>/^[0-9A-Za-z]{6,16}$/.test(t));")
+                code = cands[0] if cands else ""
+            if not code:
+                self.log("🔐 확인코드 팝업 감지했으나 코드를 못 읽음 → 직접 입력", color="red")
+                self._code_done = h
+                return
+            rev = code[::-1]
+            self.driver.execute_script(
+                "var e=document.getElementById('randeomChk');"
+                "if(e){e.value=arguments[0];e.dispatchEvent(new Event('input',{bubbles:true}));}", rev)
+            self.log(f"🔐 확인코드 '{code}' 감지 → 역순 '{rev}' 자동 입력")
+            if self.code_confirm_flag[0]:
+                self.driver.execute_script("try{goCompare();}catch(e){}")
+                self.log("   [확인] 자동 클릭 → 저장 진행됨", color="red")
+            else:
+                self.log("   역순 입력 완료 — 팝업의 [확인]은 직접 누르세요(저장)")
+            self._code_done = h
+            return
 
     def precheck_models(self):
         """대기 중 시점에 차종 목록을 가져와 데이터 차종이 있는지 미리 검사."""
@@ -719,6 +804,8 @@ class App(tk.Tk):
         self.cmd_q = queue.Queue()
         self.auto_flag = [True]
         self.addr_flag = [True]
+        self.code_flag = [True]           # 확인코드 자동입력
+        self.code_confirm_flag = [False]  # 확인(저장)까지 자동 — 기본 끔
 
         ttk.Label(self, text="① 크롬을 디버그 포트(9222)로 띄우고 로그인",
                   font=("", 9)).pack(anchor="w", padx=10, pady=(10, 0))
@@ -746,6 +833,15 @@ class App(tk.Tk):
         self.addr_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(bar2, text="주소 자동검색", variable=self.addr_var,
                         command=self.toggle_addr).pack(side="left")
+
+        bar3 = ttk.Frame(self)
+        bar3.pack(fill="x", padx=10, pady=(0, 4))
+        self.code_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bar3, text="확인코드(보안문자) 역순 자동입력", variable=self.code_var,
+                        command=self.toggle_code).pack(side="left")
+        self.code_confirm_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar3, text="확인까지 자동(=저장 실행)", variable=self.code_confirm_var,
+                        command=self.toggle_code).pack(side="left", padx=10)
 
         info = ttk.LabelFrame(self, text="현재 상태")
         info.pack(fill="x", padx=10, pady=4)
@@ -846,7 +942,8 @@ class App(tk.Tk):
         if self.worker and self.worker.is_alive():
             return
         self.worker = Worker(self.rows, self.log_q, self.state_q,
-                             self.cmd_q, self.auto_flag, self.addr_flag)
+                             self.cmd_q, self.auto_flag, self.addr_flag,
+                             self.code_flag, self.code_confirm_flag)
         self.worker.start()
         self.fill_btn.config(state="normal")
         self.reverify_btn.config(state="normal")
@@ -874,6 +971,14 @@ class App(tk.Tk):
     def toggle_addr(self):
         self.addr_flag[0] = self.addr_var.get()
         self._log(f"주소 자동검색 {'켜짐' if self.addr_flag[0] else '꺼짐'}")
+
+    def toggle_code(self):
+        self.code_flag[0] = self.code_var.get()
+        self.code_confirm_flag[0] = self.code_confirm_var.get()
+        msg = f"확인코드 자동입력 {'켜짐' if self.code_flag[0] else '꺼짐'}"
+        if self.code_confirm_flag[0]:
+            msg += " / 확인까지 자동(저장 실행됨)"
+        self._log(msg)
 
     def poll_queues(self):
         while not self.log_q.empty():
