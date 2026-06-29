@@ -192,12 +192,13 @@ def parse_vertical(path):
 
     # 연락처: 휴대폰은 '신청자 휴대폰'(mobile), 전화번호 '.'은 빈값
     # 신청자 휴대폰 = E11 의 010-... (라벨 없이 값만). 담당자 휴대폰과 구분 주의.
-    v, _ = get("전화번호")          # 보통 '.' → 빈값
-    if v and not _is_empty_val(v):
-        mapped["phone"] = v
+    # 전화/이메일은 필수(*) 칸이라 데이터의 '.' 도 그대로 입력(빈칸만 건너뜀)
+    v, _ = get("전화번호")
+    if str(v).strip():
+        mapped["phone"] = str(v).strip()
     v, _ = get("이메일")
-    if v and not _is_empty_val(v):
-        mapped["email"] = v
+    if str(v).strip():
+        mapped["email"] = str(v).strip()
     # 신청자 휴대폰: 전화번호/이메일 행에 라벨 없이 들어있는 010-... 값
     mob = mobile_in_row_of("이메일") or mobile_in_row_of("전화번호")
     if mob:
