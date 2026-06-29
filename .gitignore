@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 진단 스크립트가 뽑는 라이브 덤프(머신/세션마다 다름)
+map.json
+labels.json
+labels2.json
+addr.json
+addr_popup.json
+addr_results.json
+h2.json
+
+# PyInstaller 빌드 산출물
+build/
+dist/
+*.spec
+
+# OS
+Thumbs.db
+.DS_Store
