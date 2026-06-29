@@ -1,3 +1,4 @@
+import os
 import re
 import time
 import difflib
@@ -52,7 +53,7 @@ FIELDS = [
     {"id": "seller_mgrid",     "kind": "text",   "required": False},
 ]
 FIELD_BY_ID = {f["id"]: f for f in FIELDS}
-KNOWN_COLS = set(FIELD_BY_ID) | {"local_nm"}  # local_nm = (선택) 지자체 일치 확인용
+KNOWN_COLS = set(FIELD_BY_ID) | {"local_nm", "car_kind", "addr"}  # local_nm 지자체확인 / car_kind 전기·수소 가드 / addr 주소검색
 
 # 폼에 원하는 값이 없을 때 대체값 (예: 수소엔 개인사업자(B)가 없어 개인(P)로)
 SELECT_FALLBACK = {"req_kind": {"B": "P"}}
@@ -520,10 +521,231 @@ def verify_fill(driver, row):
     return mismatches
 
 
+# ── 첨부파일 업로드 ────────────────────────────────────────────
+# 임시저장 후 뜨는 '지원신청 첨부파일' 페이지의 각 행은
+#   <button onclick="popupAttachFile('<gubun>');return false;">첨부파일 등록</button>
+# 을 가진다. popupAttachFile 은 이름이 'attachFile' 인 팝업을 열고 editForm 을 POST 한다.
+# 자동 입력 대상 3곳(우선순위 증빙자료 A7 제외):
+#   A  = 보조금 구매지원 신청서 + 개인정보 동의서
+#   A2 = 차량 구매계약서
+#   A3 = 개인: 주민등록등본(초본)
+ATTACH_GUBUNS = ["A", "A2", "A3"]
+
+# 팝업 내부의 업로드/저장 버튼 후보 탐색용 JS
+_ATTACH_POPUP_BTN_JS = r"""
+const out=[];
+document.querySelectorAll('button,a,input[type=button],input[type=submit]').forEach(b=>{
+  const t=(b.textContent||b.value||'').trim();
+  const oc=(b.getAttribute('onclick')||'');
+  if(/업로드|등록|저장|확인|적용|첨부|전송/.test(t) || /upload|save|submit|file|attach/i.test(oc)){
+    out.push({t:t.slice(0,20), oc:oc.slice(0,140)});
+  }
+});
+return out;
+"""
+
+
+def _accept_alerts(driver, log=None, max_iter=20):
+    """업로드 직후 뜨는 alert('등록완료') 등을 자동 확인(accept).
+    드라이버가 unhandledPromptBehavior='ignore' 라 알럿이 떠 있어도
+    수동으로 switch_to.alert.accept() 는 동작한다.
+    반환: 확인한 알럿 텍스트 리스트."""
+    texts = []
+    for _ in range(max_iter):
+        try:
+            al = driver.switch_to.alert
+            t = (al.text or "").strip()
+            al.accept()
+            texts.append(t)
+            if log:
+                log(f"     알림 자동확인: '{t[:40]}'")
+            time.sleep(0.4)
+        except Exception:
+            # 알럿 없음 / 수락 직후 팝업이 닫혀 창이 사라진 경우 등
+            if texts:          # 이미 하나 이상 처리했으면 종료
+                break
+            time.sleep(0.3)
+    return texts
+
+
+def _find_attach_button(driver, gubun):
+    """popupAttachFile('<gubun>') 를 정확히 호출하는 버튼(있으면) 반환.
+    'A' 가 'A2' 에 매칭되지 않도록 세미콜론까지 포함해 비교."""
+    needle = "popupAttachFile('%s');" % gubun
+    els = driver.find_elements(By.XPATH, '//button[contains(@onclick, "%s")]' % needle)
+    return els[0] if els else None
+
+
+def _switch_to_attach_window(driver, gubun):
+    """첨부 버튼이 있는 창으로 전환하고 그 핸들을 반환(없으면 None)."""
+    for h in driver.window_handles:
+        try:
+            driver.switch_to.window(h)
+        except Exception:
+            continue
+        if _find_attach_button(driver, gubun):
+            return h
+    return None
+
+
+def upload_attachments(driver, pdf_path, gubuns=ATTACH_GUBUNS, submit=False, log=None):
+    """pdf_path 한 파일을 gubuns 각 첨부칸에 올린다.
+    submit=False: 파일만 선택해두고 팝업의 [업로드/저장]은 사람이 누름(기본, 안전).
+    submit=True : 팝업의 업로드/저장 버튼까지 자동 클릭.
+    반환: 처리한 칸 수(int)."""
+    def _log(m, c=None):
+        if log:
+            log(m, c)
+
+    if not pdf_path or not os.path.isfile(pdf_path):
+        _log(f"⛔ 첨부 PDF 파일이 없습니다: {pdf_path}", "red")
+        return 0
+
+    base_handle = _switch_to_attach_window(driver, gubuns[0])
+    if not base_handle:
+        _log("⛔ 첨부 화면을 못 찾았습니다. 임시저장 후 '지원신청 첨부파일' 화면인지 확인하세요.", "red")
+        return 0
+
+    _log(f"📎 첨부 시작: {os.path.basename(pdf_path)} → {len(gubuns)}곳 {gubuns}")
+    done = 0
+    for g in gubuns:
+        driver.switch_to.window(base_handle)
+        # 직전 업로드로 부모(첨부 화면)가 새로고침 중일 수 있어 잠깐 재시도
+        btn = None
+        for _ in range(10):
+            btn = _find_attach_button(driver, g)
+            if btn:
+                break
+            time.sleep(0.3)
+        if not btn:
+            _log(f"  ⚠ '{g}' 첨부 버튼 없음 — 건너뜀")
+            continue
+        before = set(driver.window_handles)
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+            time.sleep(0.2)
+            btn.click()  # 네이티브 클릭 = 사용자 제스처(팝업차단 회피)
+        except Exception as e:
+            _log(f"  ⚠ '{g}' 버튼 클릭 실패: {e}")
+            continue
+
+        # 팝업 대기. 'attachFile' 이름은 재사용되므로 새 핸들이 안 생길 수도 있다
+        popup = None
+        for _ in range(20):
+            time.sleep(0.3)
+            new = set(driver.window_handles) - before
+            if new:
+                popup = new.pop()
+                break
+        if not popup:
+            # 같은 이름 재사용 → 파일 input 이 있는 비(非)메인 창 탐색
+            for h in driver.window_handles:
+                if h == base_handle:
+                    continue
+                try:
+                    driver.switch_to.window(h)
+                    if driver.find_elements(By.CSS_SELECTOR, "input[type=file]"):
+                        popup = h
+                        break
+                except Exception:
+                    pass
+        if not popup:
+            _log(f"  ⚠ '{g}' 첨부 팝업이 안 떴습니다 — 건너뜀")
+            continue
+
+        driver.switch_to.window(popup)
+        # 파일 input 등장 대기
+        finp = None
+        for _ in range(20):
+            els = driver.find_elements(By.CSS_SELECTOR, "input[type=file]")
+            if els:
+                finp = els[0]
+                break
+            time.sleep(0.2)
+        if not finp:
+            _log(f"  ⚠ '{g}' 팝업에 파일 입력칸이 없습니다 — 건너뜀")
+            driver.switch_to.window(base_handle)
+            continue
+
+        try:
+            # 숨김 input 이어도 send_keys 는 동작. 혹시 막히면 보이게 처리 후 재시도
+            try:
+                finp.send_keys(pdf_path)
+            except Exception:
+                driver.execute_script(
+                    "arguments[0].style.display='block';"
+                    "arguments[0].style.visibility='visible';", finp)
+                finp.send_keys(pdf_path)
+            _log(f"  📎 '{g}' 파일 선택 완료")
+        except Exception as e:
+            _log(f"  ⚠ '{g}' 파일 지정 실패: {e}")
+            driver.switch_to.window(base_handle)
+            continue
+
+        # 팝업의 업로드/저장 버튼 후보 진단(로그)
+        try:
+            cands = driver.execute_script(_ATTACH_POPUP_BTN_JS) or []
+        except Exception:
+            cands = []
+        if cands:
+            names = ", ".join(f"'{c['t']}'" for c in cands if c.get("t"))
+            _log(f"     팝업 버튼 후보: {names or cands}")
+
+        if submit:
+            clicked = driver.execute_script(r"""
+              const els=[...document.querySelectorAll('button,a,input[type=button],input[type=submit]')];
+              const pri=el=>{const t=(el.textContent||el.value||'').trim();
+                const oc=(el.getAttribute('onclick')||'');
+                if(/업로드|전송/.test(t)) return 5;
+                if(/저장|등록|확인|적용/.test(t)) return 4;
+                if(/upload/i.test(oc)) return 3;
+                if(/save|submit/i.test(oc)) return 2;
+                if(/file|attach/i.test(oc)) return 1;
+                return 0;};
+              let best=null,bs=0;
+              els.forEach(el=>{const s=pri(el); if(s>bs){bs=s;best=el;}});
+              if(best){best.click(); return (best.textContent||best.value||'').trim().slice(0,20);}
+              return null;
+            """)
+            if clicked:
+                _log(f"  ⬆ '{g}' 업로드 버튼 자동 클릭: '{clicked}'", "green")
+                # 업로드 후 뜨는 '등록완료' 알럿 자동 확인(사람이 안 눌러도 됨)
+                _accept_alerts(driver, log=_log)
+                time.sleep(0.8)
+            else:
+                _log(f"  ⚠ '{g}' 업로드 버튼을 못 찾음 → 팝업에서 직접 누르세요", "red")
+        else:
+            _log(f"  🖐 '{g}' 파일만 선택해 둠 — 팝업의 [업로드/저장]은 직접 누르세요")
+
+        done += 1
+        # 팝업이 아직 떠 있으면 정리하고 부모 화면으로 복귀
+        try:
+            if submit:
+                for h in list(driver.window_handles):
+                    if h == base_handle:
+                        continue
+                    try:
+                        driver.switch_to.window(h)
+                        if driver.find_elements(By.ID, "filename"):
+                            driver.close()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            driver.switch_to.window(base_handle)
+        except Exception:
+            base_handle = _switch_to_attach_window(driver, gubuns[0]) or base_handle
+
+    _log(f"📎 첨부 처리 완료: {done}/{len(gubuns)}곳"
+         + ("" if submit else " (각 팝업의 업로드/저장은 직접 확인)"))
+    return done
+
+
 # ── 워커 ──────────────────────────────────────────────────────
 class Worker(threading.Thread):
     def __init__(self, rows, log_q, state_q, cmd_q, auto_flag, addr_flag,
-                 code_flag, code_confirm_flag):
+                 code_flag, code_confirm_flag, attach_pattern, attach_submit_flag):
         super().__init__(daemon=True)
         self.rows = rows
         self.log_q = log_q
@@ -533,6 +755,8 @@ class Worker(threading.Thread):
         self.addr_flag = addr_flag
         self.code_flag = code_flag            # 확인코드 자동입력 on/off
         self.code_confirm_flag = code_confirm_flag  # 확인(저장)까지 자동 on/off
+        self.attach_pattern = attach_pattern  # [str] 첨부 PDF 경로 패턴({name} 치환)
+        self.attach_submit_flag = attach_submit_flag  # [bool] 팝업 업로드/저장까지 자동
         self.idx = 0
         self.running = True
         self.driver = None
@@ -697,6 +921,8 @@ class Worker(threading.Thread):
                         self.do_fill("수동 입력")
                     elif cmd == "reverify":
                         self.reverify()
+                    elif cmd == "attach":
+                        self.do_attach()
             except queue.Empty:
                 pass
 
@@ -798,6 +1024,44 @@ class Worker(threading.Thread):
                 else:
                     self.log(f"[{i}건] ❌ 차종 선택 옵션이 없습니다: '{want}'", color="red")
 
+    def do_attach(self):
+        """임시저장 후 첨부 화면에서 현재(직전 입력) 신청자의 PDF를 3곳에 올린다."""
+        # 직전 입력 건의 신청자명으로 PDF 경로 결정
+        ridx = self.idx - 1 if self.idx > 0 else 0
+        name = ""
+        if 0 <= ridx < len(self.rows):
+            name = str(self.rows[ridx].get("req_nm", "") or "").strip()
+        pattern = (self.attach_pattern[0] or "").strip()
+        if not pattern:
+            self.log("⛔ 첨부 PDF 경로(패턴)가 비어 있습니다.", color="red")
+            self.set_state(status="⛔ 첨부 경로 없음")
+            return
+        pdf_path = pattern.replace("{name}", name)
+        self.log(f"📎 첨부 대상자: '{name or '(미상)'}' / 파일: {pdf_path}")
+        if not os.path.isfile(pdf_path):
+            self.log(f"⛔ 파일을 못 찾음: {pdf_path} — 파일명/경로를 확인하세요.", color="red")
+            self.set_state(status="⛔ 첨부 파일 없음")
+            return
+        submit = bool(self.attach_submit_flag[0])
+        try:
+            n = upload_attachments(self.driver, pdf_path, submit=submit, log=self.log)
+        except Exception as e:
+            self.log(f"첨부 오류: {e}", color="red")
+            self.set_state(status="첨부 오류 (로그 확인)")
+            return
+        finally:
+            # 작업창으로 복귀 시도
+            try:
+                if self.main_handle and self.main_handle in self.driver.window_handles:
+                    self.driver.switch_to.window(self.main_handle)
+            except Exception:
+                pass
+        if n:
+            tail = "업로드까지 자동" if submit else "파일선택 — 업로드/저장은 직접"
+            self.set_state(status=f"📎 첨부 {n}곳 ({tail})")
+        else:
+            self.set_state(status="📎 첨부 처리 0곳 — 로그 확인")
+
     def reverify(self):
         """현재 폼을 직전 입력 건과 다시 대조 (저장 직전 점검용)."""
         if self.idx == 0:
@@ -823,7 +1087,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("EV 보조금 신청 자동입력 — 검증판")
-        self.geometry("520x560")
+        self.geometry("560x720")
         self.worker = None
         self.rows = []
         self.valid = False
@@ -832,8 +1096,12 @@ class App(tk.Tk):
         self.cmd_q = queue.Queue()
         self.auto_flag = [True]
         self.addr_flag = [True]
-        self.code_flag = [True]           # 확인코드 자동입력
-        self.code_confirm_flag = [False]  # 확인(저장)까지 자동 — 기본 끔
+        self.code_flag = [True]           # 확인코드 자동입력 — 기본 켬
+        self.code_confirm_flag = [False]  # 확인(저장)까지 자동 — 기본 끔(이것만 제외)
+        _desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        # 첨부 PDF 경로 패턴: {name} 은 신청자명으로 치환됨
+        self.attach_pattern = [os.path.join(_desktop, "세종 수소 {name}.pdf")]
+        self.attach_submit_flag = [True]   # 팝업 [업로드/저장]까지 자동 — 기본 켬
 
         ttk.Label(self, text="① 크롬을 디버그 포트(9222)로 띄우고 로그인",
                   font=("", 9)).pack(anchor="w", padx=10, pady=(10, 0))
@@ -871,6 +1139,30 @@ class App(tk.Tk):
         ttk.Checkbutton(bar3, text="확인까지 자동(=저장 실행)", variable=self.code_confirm_var,
                         command=self.toggle_code).pack(side="left", padx=10)
 
+        # ── 첨부파일(임시저장 후 화면) ──
+        att = ttk.LabelFrame(self, text="첨부파일 (임시저장 후 화면에서)")
+        att.pack(fill="x", padx=10, pady=4)
+        arow = ttk.Frame(att)
+        arow.pack(fill="x", padx=6, pady=(4, 2))
+        ttk.Label(arow, text="PDF 경로", width=8).pack(side="left")
+        self.attach_var = tk.StringVar(value=self.attach_pattern[0])
+        ttk.Entry(arow, textvariable=self.attach_var).pack(side="left", fill="x",
+                                                           expand=True, padx=(0, 5))
+        ttk.Button(arow, text="찾기", width=6,
+                   command=self.pick_attach).pack(side="left")
+        arow2 = ttk.Frame(att)
+        arow2.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(arow2, text="(파일명의 신청자 자리에 {name} 사용 가능 · 신청서/계약서/등본 3곳, 우선순위증빙 제외)",
+                  font=("", 8)).pack(side="left")
+        arow3 = ttk.Frame(att)
+        arow3.pack(fill="x", padx=6, pady=(0, 5))
+        self.attach_btn = ttk.Button(arow3, text="📎 첨부 3곳 올리기", command=self.manual_attach,
+                                     state="disabled")
+        self.attach_btn.pack(side="left")
+        self.attach_submit_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(arow3, text="팝업 [업로드/저장]까지 자동", variable=self.attach_submit_var,
+                        command=self.toggle_attach).pack(side="left", padx=8)
+
         info = ttk.LabelFrame(self, text="현재 상태")
         info.pack(fill="x", padx=10, pady=4)
         self.v_status = tk.StringVar(value="대기")
@@ -907,6 +1199,20 @@ class App(tk.Tk):
             return
         rows = df.to_dict("records")
         cols = list(df.columns)
+
+        # 표형식에서도 차종·사회계층은 한글 텍스트매칭(_text_select)으로 처리
+        # (코드 없이 "디올뉴넥쏘" 등 한글명 → 페이지 옵션 대조 + 빨간경고 유지),
+        # '구분'(car_kind) 열이 없으면 차종명으로 수소차 추정(전기/수소 안전가드 유지)
+        for row in rows:
+            ts = set()
+            for fid in ("model_cd", "social_kind"):
+                if str(row.get(fid, "") or "").strip():
+                    ts.add(fid)
+            row["_text_select"] = ts
+            if not str(row.get("car_kind", "") or "").strip():
+                m = re.sub(r"\s+", "", str(row.get("model_cd", "") or ""))
+                if "넥쏘" in m or "수소" in m:
+                    row["car_kind"] = "수소"
 
         errors, warnings = validate_rows(rows, cols)
         self._log(f"── 엑셀 검증: {len(rows)}건 ──")
@@ -969,12 +1275,15 @@ class App(tk.Tk):
             return
         if self.worker and self.worker.is_alive():
             return
+        self.attach_pattern[0] = self.attach_var.get().strip()
         self.worker = Worker(self.rows, self.log_q, self.state_q,
                              self.cmd_q, self.auto_flag, self.addr_flag,
-                             self.code_flag, self.code_confirm_flag)
+                             self.code_flag, self.code_confirm_flag,
+                             self.attach_pattern, self.attach_submit_flag)
         self.worker.start()
         self.fill_btn.config(state="normal")
         self.reverify_btn.config(state="normal")
+        self.attach_btn.config(state="normal")
         self._log("워커 시작")
 
     def stop(self):
@@ -982,6 +1291,7 @@ class App(tk.Tk):
             self.worker.stop()
             self.fill_btn.config(state="disabled")
             self.reverify_btn.config(state="disabled")
+            self.attach_btn.config(state="disabled")
             self._log("정지 요청")
 
     def manual_fill(self):
@@ -991,6 +1301,25 @@ class App(tk.Tk):
     def manual_reverify(self):
         if self.worker and self.worker.is_alive():
             self.cmd_q.put("reverify")
+
+    def manual_attach(self):
+        if self.worker and self.worker.is_alive():
+            self.attach_pattern[0] = self.attach_var.get().strip()
+            self.cmd_q.put("attach")
+        else:
+            self._log("첨부하려면 먼저 [시작] 하세요.")
+
+    def pick_attach(self):
+        path = filedialog.askopenfilename(
+            title="첨부할 PDF 선택", filetypes=[("PDF", "*.pdf"), ("모든 파일", "*.*")])
+        if path:
+            self.attach_var.set(path)
+            self.attach_pattern[0] = path
+
+    def toggle_attach(self):
+        self.attach_submit_flag[0] = self.attach_submit_var.get()
+        self._log("팝업 업로드/저장까지 자동 "
+                  + ("켜짐 (자동 업로드 실행됨)" if self.attach_submit_flag[0] else "꺼짐"))
 
     def toggle_auto(self):
         self.auto_flag[0] = self.auto_var.get()

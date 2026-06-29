@@ -180,12 +180,19 @@ def parse_vertical(path):
         mapped["delivery_sch_day"] = _date_norm(v)
 
     # 주소
-    v, _ = get("주소")
-    if v:
-        mapped["addr"] = v
+    addr_val, addr_pos = get("주소")
+    if addr_val:
+        mapped["addr"] = addr_val
     v, _ = get("이하주소")
     if v:
         mapped["addr_detail"] = v
+    elif addr_pos:
+        # 라벨 없는 양식: 주소(도로명) 값 오른쪽 다음 셀을 상세주소로 사용
+        ar, ac = addr_pos
+        for cc in range(ac + 1, maxc + 1):
+            if (ar, cc) in grid:
+                mapped["addr_detail"] = grid[(ar, cc)]
+                break
     # 우편번호는 데이터에 없음 → 주소(도로명)로 검색 팝업 자동화(결과 1개일 때 자동 선택)
     notes.append("※ 우편번호는 '주소'(도로명)로 주소검색 팝업을 자동 실행합니다. "
                  "결과가 정확히 1개면 자동 선택, 여러 개/0개면 팝업에서 직접 선택.")
@@ -194,13 +201,23 @@ def parse_vertical(path):
     # 신청자 휴대폰 = E11 의 010-... (라벨 없이 값만). 담당자 휴대폰과 구분 주의.
     # 전화/이메일은 필수(*) 칸이라 데이터의 '.' 도 그대로 입력(빈칸만 건너뜀)
     v, _ = get("전화번호")
+    if not str(v).strip():
+        v, _ = get("전화")
     if str(v).strip():
         mapped["phone"] = str(v).strip()
     v, _ = get("이메일")
     if str(v).strip():
         mapped["email"] = str(v).strip()
-    # 신청자 휴대폰: 전화번호/이메일 행에 라벨 없이 들어있는 010-... 값
-    mob = mobile_in_row_of("이메일") or mobile_in_row_of("전화번호")
+    # 신청자 휴대폰:
+    #  - (구양식) 전화/이메일 행에 라벨 없이 들어있는 010-... 값
+    #  - (실양식) '휴대폰' 라벨이 신청자용 (별도로 '연락담당휴대폰' 라벨이 존재)
+    mob = (mobile_in_row_of("이메일") or mobile_in_row_of("전화번호")
+           or mobile_in_row_of("전화"))
+    if not mob and label_pos.get(_norm("연락담당휴대폰")):
+        hv, _ = get("휴대폰")
+        m = MOBILE_RE.search(str(hv).replace(" ", ""))
+        if m:
+            mob = m.group(0)
     if mob:
         mapped["mobile"] = mob
 
@@ -230,15 +247,24 @@ def parse_vertical(path):
         else:
             handoff.append(("우선순위", v, "priority_type 매칭 실패"))
 
-    # 담당자성명 → contact_nm, 담당자 휴대폰 → contact_mobile (라벨 '휴대폰')
-    v, _ = get("담당자성명")
+    # 연락담당 성명 → contact_nm (구양식: '담당자성명')
+    v, _ = get("연락담당성명")
+    if not v:
+        v, _ = get("담당자성명")
     if v:
         mapped["contact_nm"] = v
-    v, _ = get("휴대폰")
+    # 연락담당 휴대폰 → contact_mobile
+    #  - 실양식: '연락담당휴대폰' 라벨
+    #  - 구양식: '휴대폰' 라벨 (이때 신청자 휴대폰은 라벨 없는 값에서 읽음)
+    v, _ = get("연락담당휴대폰")
+    if not v:
+        v, _ = get("휴대폰")
     if v and MOBILE_RE.search(v.replace(" ", "")):
         mapped["contact_mobile"] = v
-    # 계약번호 → 제조수입사 관리(계약)번호 (seller_mgrid)
-    v, _ = get("계약번호")
+    # 제조수입사 관리(계약)번호 → seller_mgrid (구양식: '계약번호')
+    v, _ = get("제조수입사계약번호")
+    if not v:
+        v, _ = get("계약번호")
     if v:
         mapped["seller_mgrid"] = v
 
@@ -255,6 +281,14 @@ def parse_vertical(path):
 
     # 암호 역순
     handoff.append(("암호 역순 입력", "제출 직전 단계", "캡차성 단계 → 사람이 직접 (자동화 안 함)"))
+
+    # '구분' 칸이 없을 때: 수소 전용 차종명(넥쏘 등)이면 수소로 추정(안전가드용)
+    if "car_kind" not in mapped:
+        mtxt = _norm(special.get("model_cd", ""))
+        if "넥쏘" in mtxt or "수소" in mtxt:
+            mapped["car_kind"] = "수소"
+            notes.append("※ '구분' 칸이 없어 차종으로 수소차로 추정했습니다. "
+                         "열린 폼이 수소(H2)인지 꼭 확인하세요.")
 
     return {"mapped": mapped, "special": special, "handoff": handoff, "notes": notes}
 

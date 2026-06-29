@@ -15,6 +15,16 @@ addr_popup.json
 addr_results.json
 h2.json
 
+# ⚠ 실제 신청자 개인정보(절대 커밋 금지): 실전 데이터/생성 스크립트/라이브 덤프
+real_0701/
+make_0701.py
+make_0701_tabular.py
+tools/_attach_dump.html
+tools/_attach_popup_dump.html
+*.jpg
+*.jpeg
+*.png
+
 # PyInstaller 빌드 산출물
 build/
 dist/
