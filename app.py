@@ -528,7 +528,8 @@ class Worker(threading.Thread):
         self.driver = None
         self.blank_handled = False
         self.main_handle = None
-        self._code_done = None                # 이미 채운 팝업 핸들
+        self._known_handles = set()    # 이미 본 창들(새 창만 검사 → 포커스 도둑질 방지)
+        self._popup_focus = None       # 사용자가 [확인] 누를 보안팝업(포커스 유지)
 
     def log(self, msg, color=None):
         self.log_q.put((time.strftime("[%H:%M:%S] ") + msg, color))
@@ -653,20 +654,28 @@ class Worker(threading.Thread):
         self.log(f"총 {len(self.rows)}건 대기 중.")
         self.set_state(status="대기 중 — 신청서 폼에서 입력 준비",
                        progress=f"{self.idx}/{len(self.rows)}")
+        self._known_handles = set(self.driver.window_handles)
         self.precheck_models()
 
         while self.running:
-            # 보안 확인코드 팝업 자동 처리(있으면) + 메인 창 복귀
+            # 보안 확인코드 팝업: 새 창이 생겼을 때만 검사(평소엔 창 전환 0회)
             if self.code_flag[0]:
                 try:
                     self.handle_random_popup()
                 except Exception:
                     pass
-            try:
-                if self.main_handle and self.driver.current_window_handle != self.main_handle:
-                    self.driver.switch_to.window(self.main_handle)
-            except Exception:
-                pass
+
+            # 사용자가 [확인] 누를 보안팝업이 떠 있으면 폼 폴링/전환을 멈춰 포커스 양보
+            if self._popup_focus:
+                try:
+                    if self._popup_focus not in self.driver.window_handles:
+                        self._popup_focus = None
+                except Exception:
+                    self._popup_focus = None
+                if self._popup_focus:
+                    self.set_state(status="🔐 보안팝업: 역순 입력됨 — [확인] 직접 누르세요")
+                    time.sleep(0.5)
+                    continue
 
             try:
                 while True:
@@ -693,28 +702,27 @@ class Worker(threading.Thread):
             time.sleep(0.5)
 
     def handle_random_popup(self):
-        """보안 확인코드 팝업(popupSellerRandomChk)이 뜨면 코드 역순을 자동 입력."""
+        """새로 뜬 창만 검사. 보안 확인코드 팝업이면 코드 역순을 자동 입력.
+        평소(새 창 없음)엔 창 전환을 하지 않아 포커스를 뺏지 않는다."""
         try:
-            handles = self.driver.window_handles
+            handles = set(self.driver.window_handles)
         except Exception:
             return
-        # 닫힌 팝업이면 가드 해제
-        if self._code_done and self._code_done not in handles:
-            self._code_done = None
-        for h in handles:
-            if h == self.main_handle:
-                continue
+        new = handles - self._known_handles
+        if not new:
+            self._known_handles &= handles   # 닫힌 창 정리
+            return
+        self._known_handles = handles
+        stay_on = None
+        for h in new:
             try:
                 self.driver.switch_to.window(h)
                 url = self.driver.current_url
             except Exception:
                 continue
             if "RandomChk" not in url and "popupSellerRandom" not in url:
-                continue
-            if self._code_done == h:
-                return  # 이미 채움(사용자 입력 덮어쓰기 방지)
-            # 화면 코드 읽기: goCompare 소스의 실제 코드를 우선(검증이 쓰는 값).
-            # 실패 시 span.guide 중 ASCII 영숫자 텍스트.
+                continue  # 사용자가 연 다른 창 — 건드리지 않음
+            # 화면 코드: goCompare 소스의 실제 코드 우선(검증이 쓰는 값)
             code = ""
             src = self.driver.execute_script(
                 "try{return goCompare.toString()}catch(e){return ''}")
@@ -729,8 +737,7 @@ class Worker(threading.Thread):
                 code = cands[0] if cands else ""
             if not code:
                 self.log("🔐 확인코드 팝업 감지했으나 코드를 못 읽음 → 직접 입력", color="red")
-                self._code_done = h
-                return
+                continue
             rev = code[::-1]
             self.driver.execute_script(
                 "var e=document.getElementById('randeomChk');"
@@ -740,9 +747,17 @@ class Worker(threading.Thread):
                 self.driver.execute_script("try{goCompare();}catch(e){}")
                 self.log("   [확인] 자동 클릭 → 저장 진행됨", color="red")
             else:
-                self.log("   역순 입력 완료 — 팝업의 [확인]은 직접 누르세요(저장)")
-            self._code_done = h
-            return
+                self.log("   역순 입력 완료 — 이 팝업의 [확인]을 직접 누르세요(저장)")
+                stay_on = h   # 팝업에 포커스 남겨 사용자가 바로 확인
+        # 포커스 정리: 수동확인이면 팝업에, 아니면 메인 폼으로
+        try:
+            if stay_on:
+                self.driver.switch_to.window(stay_on)
+                self._popup_focus = stay_on
+            elif self.main_handle:
+                self.driver.switch_to.window(self.main_handle)
+        except Exception:
+            pass
 
     def precheck_models(self):
         """대기 중 시점에 차종 목록을 가져와 데이터 차종이 있는지 미리 검사."""
