@@ -742,10 +742,128 @@ def upload_attachments(driver, pdf_path, gubuns=ATTACH_GUBUNS, submit=False, log
     return done
 
 
+# ── 임시저장(안전형) ───────────────────────────────────────────
+# 라이브 H2 폼 확인 결과:
+#   [임시저장] 버튼  : text="임시저장", onclick="goSave();return false;"
+#   goSave() → goSave_1('N') → (유효성검사) → confirm("임시저장을 하시겠습니까?")
+#            → OK → checkFinish() → 보안 확인코드 팝업창(popupSellerRandomChk)
+# 안전 원칙: '임시저장' 텍스트 + onclick goSave() 인 버튼만, 화면에 보이고 유일할 때만 클릭.
+#            '신청/제출/지급/우선순위/저장(단독)' 등은 절대 누르지 않는다(오발송 방지).
+_SAVE_AVOID = ("신청", "제출", "최종", "지급", "우선순위", "취소", "삭제", "보완", "등록")
+
+
+def _find_temp_save_buttons(driver):
+    """화면에 보이는 '임시저장' 버튼 후보 [(el, text)]. goSave() onclick 인 것만."""
+    cands = []
+    try:
+        els = driver.find_elements(
+            By.XPATH,
+            "//button|//a|//input[@type='button']|//input[@type='submit']")
+    except Exception:
+        return cands
+    for el in els:
+        try:
+            t = (el.text or el.get_attribute("value") or "").strip()
+        except Exception:
+            continue
+        if "임시저장" not in t or len(t) >= 20:
+            continue
+        if any(a in t for a in _SAVE_AVOID):
+            continue
+        oc = (el.get_attribute("onclick") or "")
+        if "goSave(" not in oc:        # goSavePay/goPriSave 등 배제
+            continue
+        try:
+            if el.is_displayed():
+                cands.append((el, t))
+        except Exception:
+            pass
+    return cands
+
+
+# confirm/alert 를 가로채 둔다(한 번 설치하면 페이지가 살아있는 동안 계속 유지).
+#  - confirm("임시저장을 하시겠습니까?") → 네이티브 대화상자 없이 자동 OK(true) 반환
+#  - alert(...)  → 화면 대화상자 대신 배열(window.__cm_msgs)로 수집
+# 왜 'persistent' 인가: "임시저장 완료" 알림은 보안코드 처리·저장이 다 끝난 한참 뒤에
+# 뜬다. 잠깐만 가로채고 풀면 그 완료 알림이 네이티브 창으로 떠 멈춰버린다(드라이버까지 블록).
+# 그래서 풀지 않고 유지하고, 워커 루프가 __cm_msgs 를 비우며 로그로 남긴다.
+# checkFinish() 가 여는 보안코드 '창'(window.open)은 영향 없음 → 워커가 따로 처리.
+_ALERT_HOOK_JS = r"""
+if(!window.__cm_hooked){
+  window.__cm_hooked = true;
+  window.__cm_msgs = [];
+  window.confirm = function(m){ window.__cm_msgs.push('[confirm]'+String(m)); return true; };
+  window.alert   = function(m){ window.__cm_msgs.push('[alert]'+String(m)); };
+}
+"""
+_ALERT_DRAIN_JS = r"""
+if(!window.__cm_msgs){ return []; }
+var m = window.__cm_msgs; window.__cm_msgs = []; return m;
+"""
+# alert 메시지가 '저장 진행 안 됨'을 뜻하는지 판단할 키워드(검증/차단 메시지)
+_SAVE_BLOCK_HINTS = ("입력", "선택", "확인해", "0원", "중복", "최대", "권한", "없습니다", "다시")
+
+
+def click_temp_save(driver, log=None):
+    """'임시저장' 버튼을 안전하게 클릭. confirm("임시저장을 하시겠습니까?")은 자동 OK.
+    보안 확인코드 팝업창은 건드리지 않는다(워커의 handle_random_popup 가 처리).
+    반환: 'ok'(저장 진행) | 'blocked'(검증 등으로 저장 안 됨) | 'notfound' | 'ambiguous' | 'error'."""
+    def _log(m, c=None):
+        if log:
+            log(m, c)
+
+    cands = _find_temp_save_buttons(driver)
+    if not cands:
+        _log("⛔ '임시저장' 버튼을 못 찾았습니다 → 직접 누르세요", "red")
+        return "notfound"
+    if len(cands) > 1:
+        names = ", ".join(f"'{t}'" for _, t in cands)
+        _log(f"⛔ '임시저장' 후보가 여러 개({names}) → 안전상 자동 클릭 보류, 직접 누르세요", "red")
+        return "ambiguous"
+
+    btn, label = cands[0]
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+        driver.execute_script(_ALERT_HOOK_JS)  # confirm/alert 가로채기(유지 — 풀지 않음)
+        time.sleep(0.2)
+        btn.click()                            # 네이티브 클릭. confirm 자동 OK 라 안 멈춤.
+        _log(f"💾 '{label}' 클릭")
+    except Exception as e:
+        _log(f"⛔ '임시저장' 클릭 실패: {e}", "red")
+        return "error"
+
+    # checkFinish() 의 비동기 검사(alert(RETURNMSG)) 까지 잠깐 대기 후 메시지 수집.
+    # 'hook' 은 풀지 않는다 → 한참 뒤의 "임시저장 완료" 알림은 워커 루프가 비워서 처리.
+    time.sleep(1.2)
+    try:
+        msgs = driver.execute_script(_ALERT_DRAIN_JS) or []
+    except Exception:
+        msgs = []   # 페이지가 이미 넘어갔으면 메시지 못 읽음
+
+    has_confirm = any(str(m).startswith("[confirm]") for m in msgs)
+    alerts = [str(m)[len("[alert]"):] for m in msgs if str(m).startswith("[alert]")]
+    block_alerts = [a for a in alerts if any(k in a for k in _SAVE_BLOCK_HINTS)]
+
+    if block_alerts:
+        joined = " / ".join(block_alerts)
+        _log(f"⛔ 임시저장 차단(검증 알럿): '{joined}' → 저장 안 됨, 폼 확인 필요", "red")
+        return "blocked"
+    if has_confirm:
+        _log("   확인창 자동 OK — 보안코드 팝업/첨부화면으로 진행", "green")
+        return "ok"
+    if alerts:
+        _log(f"   알림: '{' / '.join(alerts)}'")
+        return "ok"
+    # confirm 도 alert 도 없었음: 페이지가 이미 넘어갔거나(저장 진행) 흐름이 다름
+    _log("   확인창 없이 진행됨(저장 단계로 넘어갔을 수 있음) — 보안팝업/첨부화면 확인")
+    return "ok"
+
+
 # ── 워커 ──────────────────────────────────────────────────────
 class Worker(threading.Thread):
     def __init__(self, rows, log_q, state_q, cmd_q, auto_flag, addr_flag,
-                 code_flag, code_confirm_flag, attach_pattern, attach_submit_flag):
+                 code_flag, code_confirm_flag, attach_pattern, attach_submit_flag,
+                 autosave_flag, autoattach_flag):
         super().__init__(daemon=True)
         self.rows = rows
         self.log_q = log_q
@@ -757,6 +875,9 @@ class Worker(threading.Thread):
         self.code_confirm_flag = code_confirm_flag  # 확인(저장)까지 자동 on/off
         self.attach_pattern = attach_pattern  # [str] 첨부 PDF 경로 패턴({name} 치환)
         self.attach_submit_flag = attach_submit_flag  # [bool] 팝업 업로드/저장까지 자동
+        self.autosave_flag = autosave_flag    # [bool] 검증 통과 시 임시저장 자동 클릭
+        self.autoattach_flag = autoattach_flag  # [bool] 첨부화면 감지 시 자동 업로드
+        self.attach_handled = False           # 첨부 자동 1회 처리 디바운스
         self.idx = 0
         self.running = True
         self.driver = None
@@ -764,6 +885,7 @@ class Worker(threading.Thread):
         self.main_handle = None
         self._known_handles = set()    # 이미 본 창들(새 창만 검사 → 포커스 도둑질 방지)
         self._popup_focus = None       # 사용자가 [확인] 누를 보안팝업(포커스 유지)
+        self._save_armed = False       # 임시저장을 한 번이라도 쓰면 알림 가로채기 유지
 
     def log(self, msg, color=None):
         self.log_q.put((time.strftime("[%H:%M:%S] ") + msg, color))
@@ -842,16 +964,34 @@ class Worker(threading.Thread):
         time.sleep(0.3)
         mm = verify_fill(self.driver, row)
         self.idx += 1
+        # 차종(model_cd)은 '가장 비슷한 것'으로 들어가 거의 불일치 → 임시저장 차단에서 제외.
+        # (사람이 빨간 경고로 직접 확인하기로 한 항목. 단, 화면엔 그대로 표시함)
+        blocking = [m for m in mm if m[0] != "model_cd"]
+        model_mm = [m for m in mm if m[0] == "model_cd"]
         if mm:
-            self.log(f"❌ {self.idx}번째 검증 실패 — 불일치 {len(mm)}건:")
+            self.log(f"❌ {self.idx}번째 검증 — 불일치 {len(mm)}건:")
             for fid, want, got in mm:
-                self.log(f"    · {fid}: 기대 '{want}' / 실제 '{got}'")
-            self.set_state(status=f"❌ 검증 실패 {len(mm)}건 — 저장 말고 직접 확인!",
+                tag = "  ← 차종(자동저장 차단 제외, 직접 확인!)" if fid == "model_cd" else ""
+                self.log(f"    · {fid}: 기대 '{want}' / 실제 '{got}'{tag}",
+                         color=("red" if fid == "model_cd" else None))
+        if blocking:
+            self.set_state(status=f"❌ 검증 실패 {len(blocking)}건 — 저장 말고 직접 확인!",
+                           progress=f"{self.idx}/{len(self.rows)}")
+            return
+        # 여기부터: 차종 외 모든 항목 일치(통과). 차종만 불일치면 경고 후 진행.
+        if model_mm:
+            self.log("⚠ 차종 외 항목은 모두 일치 — 차종은 직접 확인하기로 하고 진행", color="red")
+            self.set_state(status="⚠ 차종 외 통과 — (차종 직접 확인)",
                            progress=f"{self.idx}/{len(self.rows)}")
         else:
             self.log(f"✅ {self.idx}번째 입력·검증 통과. 검토 후 저장/제출은 직접.")
             self.set_state(status="✅ 검증 통과 — 검토 후 다음 폼으로",
                            progress=f"{self.idx}/{len(self.rows)}")
+        # 임시저장 자동(옵션): 차종 외 불일치가 없을 때만. (차종은 위에서 경고함)
+        if self.autosave_flag[0]:
+            time.sleep(0.4)
+            self.log("자동 임시저장 진행(차종 외 검증 통과 건)…")
+            self.do_temp_save()
 
     def run(self):
         # 연결 검증
@@ -895,6 +1035,9 @@ class Worker(threading.Thread):
         self.precheck_models()
 
         while self.running:
+            # 가로챈 알림(confirm OK / "임시저장 완료" 등) 비우며 로그 — 네이티브 창 방지
+            self._pump_alerts()
+
             # 보안 확인코드 팝업: 새 창이 생겼을 때만 검사(평소엔 창 전환 0회)
             if self.code_flag[0]:
                 try:
@@ -914,6 +1057,9 @@ class Worker(threading.Thread):
                     time.sleep(0.5)
                     continue
 
+            # 보안팝업 포커스가 없을 때만: 저장 완료 등 네이티브 alert 자동 수락
+            self._accept_native_alert()
+
             try:
                 while True:
                     cmd = self.cmd_q.get_nowait()
@@ -923,6 +1069,8 @@ class Worker(threading.Thread):
                         self.reverify()
                     elif cmd == "attach":
                         self.do_attach()
+                    elif cmd == "tempsave":
+                        self.do_temp_save()
             except queue.Empty:
                 pass
 
@@ -930,7 +1078,21 @@ class Worker(threading.Thread):
             req_nm = get_value(self.driver, "req_nm")
             self.set_state(local=local or "(미선택)")
 
-            blank_form = self.on_form() and local != "" and req_nm == ""
+            # 첨부 화면 감지(지자체 감지처럼): 감지되면 상태표시 + 옵션 시 자동 업로드
+            on_attach = self.on_attach_screen()
+            if not on_attach:
+                self.attach_handled = False
+            else:
+                if not self.attach_handled:
+                    self.set_state(status="📎 첨부화면 감지됨"
+                                   + (" — 자동 업로드 진행" if self.autoattach_flag[0]
+                                      else " — [📎 첨부] 또는 자동옵션"))
+                if self.autoattach_flag[0] and not self.attach_handled:
+                    self.attach_handled = True   # 1회만(중복 업로드 방지)
+                    self.log("첨부화면 자동 감지 → 첨부 업로드 진행")
+                    self.do_attach()
+
+            blank_form = self.on_form() and local != "" and req_nm == "" and not on_attach
             if not blank_form:
                 self.blank_handled = False
 
@@ -1062,6 +1224,99 @@ class Worker(threading.Thread):
         else:
             self.set_state(status="📎 첨부 처리 0곳 — 로그 확인")
 
+    def _accept_native_alert(self):
+        """JS 가로채기로 못 막는 네이티브 alert 를 드라이버로 직접 수락.
+        대표 사례: 저장 완료 후 randomsave(iframe)에서 뜨는 '임시저장 완료' alert.
+        임시저장을 한 번이라도 쓴 뒤(_save_armed)에만, 보안팝업 포커스가 없을 때만 동작."""
+        if not self._save_armed:
+            return
+        # 현재 창이 죽었으면(닫힌 팝업 등) 메인 폼으로 복귀 후 검사
+        try:
+            self.driver.current_window_handle
+        except Exception:
+            try:
+                if self.main_handle and self.main_handle in self.driver.window_handles:
+                    self.driver.switch_to.window(self.main_handle)
+            except Exception:
+                return
+        try:
+            al = self.driver.switch_to.alert
+            t = (al.text or "").strip()
+            al.accept()
+        except Exception:
+            return  # 떠 있는 alert 없음
+        if "완료" in t:
+            self.log(f"   ✅ 완료 알림 자동확인: '{t}'", color="green")
+            self.set_state(status="✅ 임시저장 완료 — 첨부화면 확인")
+        elif any(k in t for k in _SAVE_BLOCK_HINTS):
+            self.log(f"   ⛔ 알림(저장 안 됨 가능): '{t}'", color="red")
+        else:
+            self.log(f"   알림 자동확인: '{t}'")
+
+    def _pump_alerts(self):
+        """가로챈 confirm/alert 메시지(window.__cm_msgs)를 비우며 로그로 남긴다.
+        현재 창 기준으로만 동작(창 전환 안 함 → 포커스 도둑질 없음).
+        hook 이 안 걸린 창이면 그냥 빈 결과."""
+        try:
+            if self._save_armed:
+                # 저장 후 페이지가 다시 그려져도 가로채기가 살아있도록 재설치(멱등)
+                self.driver.execute_script(_ALERT_HOOK_JS)
+            msgs = self.driver.execute_script(_ALERT_DRAIN_JS) or []
+        except Exception:
+            return
+        for m in msgs:
+            s = str(m)
+            if s.startswith("[confirm]"):
+                self.log(f"   확인창 자동 OK: '{s[len('[confirm]'):]}'", color="green")
+                continue
+            txt = s[len("[alert]"):] if s.startswith("[alert]") else s
+            if "완료" in txt:
+                self.log(f"   ✅ 완료 알림 자동확인: '{txt}'", color="green")
+            elif any(k in txt for k in _SAVE_BLOCK_HINTS):
+                self.log(f"   ⛔ 알림(저장 안 됨 가능): '{txt}'", color="red")
+            else:
+                self.log(f"   알림 자동확인: '{txt}'")
+
+    def on_attach_screen(self):
+        """'지원신청 첨부파일' 화면인지 감지.
+        신호: 같은 sellerApplyform URL 인데 ① popupAttachFile('A') 버튼이 보이고
+              ② 임시저장 버튼이 사라짐(입력 폼 단계가 끝남)."""
+        try:
+            if not self.on_form():
+                return False
+            b = _find_attach_button(self.driver, ATTACH_GUBUNS[0])
+            if not (b and b.is_displayed()):
+                return False
+            if _find_temp_save_buttons(self.driver):
+                return False   # 임시저장 버튼이 아직 있으면 입력 폼 단계
+            return True
+        except Exception:
+            return False
+
+    def do_temp_save(self):
+        """'임시저장' 버튼을 안전하게 클릭(confirm 자동 수락). 보안코드 팝업은 기존 루프가 처리."""
+        if not self.on_form():
+            self.log("⚠ 임시저장: 신청서 작성 폼이 아닙니다 → 보류", color="red")
+            self.set_state(status="⚠ 임시저장 보류 — 폼 아님")
+            return
+        self._save_armed = True   # 이후 루프가 알림 가로채기를 유지
+        try:
+            st = click_temp_save(self.driver, log=self.log)
+        except Exception as e:
+            self.log(f"임시저장 오류: {e}", color="red")
+            self.set_state(status="임시저장 오류 (로그 확인)")
+            return
+        finally:
+            try:
+                if self.main_handle and self.main_handle in self.driver.window_handles:
+                    self.driver.switch_to.window(self.main_handle)
+            except Exception:
+                pass
+        if st == "ok":
+            self.set_state(status="💾 임시저장 클릭 — 보안코드/첨부화면 확인")
+        else:
+            self.set_state(status="💾 임시저장 보류 — 직접 누르세요")
+
     def reverify(self):
         """현재 폼을 직전 입력 건과 다시 대조 (저장 직전 점검용)."""
         if self.idx == 0:
@@ -1098,6 +1353,8 @@ class App(tk.Tk):
         self.addr_flag = [True]
         self.code_flag = [True]           # 확인코드 자동입력 — 기본 켬
         self.code_confirm_flag = [False]  # 확인(저장)까지 자동 — 기본 끔(이것만 제외)
+        self.autosave_flag = [False]      # 검증 통과 시 임시저장 자동 — 기본 끔(opt-in)
+        self.autoattach_flag = [False]    # 첨부화면 감지 시 자동 업로드 — 기본 끔(opt-in)
         _desktop = os.path.join(os.path.expanduser("~"), "Desktop")
         # 첨부 PDF 경로 패턴: {name} 은 신청자명으로 치환됨
         self.attach_pattern = [os.path.join(_desktop, "세종 수소 {name}.pdf")]
@@ -1139,6 +1396,18 @@ class App(tk.Tk):
         ttk.Checkbutton(bar3, text="확인까지 자동(=저장 실행)", variable=self.code_confirm_var,
                         command=self.toggle_code).pack(side="left", padx=10)
 
+        # ── 임시저장 ──
+        bar4 = ttk.Frame(self)
+        bar4.pack(fill="x", padx=10, pady=(0, 4))
+        self.tempsave_btn = ttk.Button(bar4, text="💾 임시저장", command=self.manual_tempsave,
+                                       state="disabled")
+        self.tempsave_btn.pack(side="left")
+        self.autosave_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar4, text="검증 통과 시 임시저장 자동", variable=self.autosave_var,
+                        command=self.toggle_autosave).pack(side="left", padx=8)
+        ttk.Label(bar4, text="('임시저장' 버튼+확인창만 자동 · 보안코드 [확인]은 위 옵션)",
+                  font=("", 8)).pack(side="left")
+
         # ── 첨부파일(임시저장 후 화면) ──
         att = ttk.LabelFrame(self, text="첨부파일 (임시저장 후 화면에서)")
         att.pack(fill="x", padx=10, pady=4)
@@ -1162,6 +1431,9 @@ class App(tk.Tk):
         self.attach_submit_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(arow3, text="팝업 [업로드/저장]까지 자동", variable=self.attach_submit_var,
                         command=self.toggle_attach).pack(side="left", padx=8)
+        self.autoattach_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(arow3, text="첨부화면 감지 시 자동 업로드", variable=self.autoattach_var,
+                        command=self.toggle_autoattach).pack(side="left", padx=8)
 
         info = ttk.LabelFrame(self, text="현재 상태")
         info.pack(fill="x", padx=10, pady=4)
@@ -1279,11 +1551,13 @@ class App(tk.Tk):
         self.worker = Worker(self.rows, self.log_q, self.state_q,
                              self.cmd_q, self.auto_flag, self.addr_flag,
                              self.code_flag, self.code_confirm_flag,
-                             self.attach_pattern, self.attach_submit_flag)
+                             self.attach_pattern, self.attach_submit_flag,
+                             self.autosave_flag, self.autoattach_flag)
         self.worker.start()
         self.fill_btn.config(state="normal")
         self.reverify_btn.config(state="normal")
         self.attach_btn.config(state="normal")
+        self.tempsave_btn.config(state="normal")
         self._log("워커 시작")
 
     def stop(self):
@@ -1292,6 +1566,7 @@ class App(tk.Tk):
             self.fill_btn.config(state="disabled")
             self.reverify_btn.config(state="disabled")
             self.attach_btn.config(state="disabled")
+            self.tempsave_btn.config(state="disabled")
             self._log("정지 요청")
 
     def manual_fill(self):
@@ -1308,6 +1583,22 @@ class App(tk.Tk):
             self.cmd_q.put("attach")
         else:
             self._log("첨부하려면 먼저 [시작] 하세요.")
+
+    def manual_tempsave(self):
+        if self.worker and self.worker.is_alive():
+            self.cmd_q.put("tempsave")
+        else:
+            self._log("임시저장하려면 먼저 [시작] 하세요.")
+
+    def toggle_autosave(self):
+        self.autosave_flag[0] = self.autosave_var.get()
+        self._log("검증 통과 시 임시저장 자동 "
+                  + ("켜짐 (검증 통과 건만 임시저장 클릭)" if self.autosave_flag[0] else "꺼짐"))
+
+    def toggle_autoattach(self):
+        self.autoattach_flag[0] = self.autoattach_var.get()
+        self._log("첨부화면 감지 시 자동 업로드 "
+                  + ("켜짐 (첨부화면 뜨면 A/A2/A3 자동)" if self.autoattach_flag[0] else "꺼짐"))
 
     def pick_attach(self):
         path = filedialog.askopenfilename(
