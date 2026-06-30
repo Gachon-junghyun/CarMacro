@@ -1415,8 +1415,11 @@ class App(tk.Tk):
         arow.pack(fill="x", padx=6, pady=(4, 2))
         ttk.Label(arow, text="PDF 경로", width=8).pack(side="left")
         self.attach_var = tk.StringVar(value=self.attach_pattern[0])
-        ttk.Entry(arow, textvariable=self.attach_var).pack(side="left", fill="x",
-                                                           expand=True, padx=(0, 5))
+        # tk.Entry(클래식) — 테두리 색을 줄 수 있음(ttk.Entry는 macOS에서 테두리색 안 먹힘)
+        self.attach_entry = tk.Entry(arow, textvariable=self.attach_var,
+                                     highlightthickness=2)
+        self.attach_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        self.attach_entry.bind("<KeyRelease>", lambda e: self._refresh_pdf_border())
         ttk.Button(arow, text="찾기", width=6,
                    command=self.pick_attach).pack(side="left")
         arow2 = ttk.Frame(att)
@@ -1437,6 +1440,13 @@ class App(tk.Tk):
 
         info = ttk.LabelFrame(self, text="현재 상태")
         info.pack(fill="x", padx=10, pady=4)
+        # 워커 상태등: 작동중=초록, 정지=빨강
+        wrow = ttk.Frame(info)
+        wrow.pack(fill="x", padx=6, pady=2)
+        ttk.Label(wrow, text="워커", width=12).pack(side="left")
+        self.worker_dot = tk.Label(wrow, text="● 정지 (시작 안 함)",
+                                   fg="#cc0000", font=("", 10, "bold"))
+        self.worker_dot.pack(side="left")
         self.v_status = tk.StringVar(value="대기")
         self.v_local = tk.StringVar(value="(미선택)")
         self.v_prog = tk.StringVar(value="0/0")
@@ -1454,7 +1464,33 @@ class App(tk.Tk):
         self.log_box.tag_config("red", foreground="#cc0000")
         self.log_box.tag_config("green", foreground="#117711")
 
+        self._refresh_pdf_border()
+        self._refresh_worker_dot()
         self.after(200, self.poll_queues)
+
+    def _refresh_pdf_border(self):
+        """PDF 경로 미설정/없는 파일이면 테두리 빨강, 정상이면 초록."""
+        path = self.attach_var.get().strip()
+        # {name} 템플릿이면 신청자명 들어오기 전이라 파일존재 확인 불가 → 경로만 있으면 OK로 본다
+        if not path:
+            ok = False
+        elif "{name}" in path:
+            ok = True
+        else:
+            ok = os.path.isfile(path)
+        color = "#117711" if ok else "#cc0000"
+        try:
+            self.attach_entry.config(highlightbackground=color, highlightcolor=color)
+        except Exception:
+            pass
+
+    def _refresh_worker_dot(self):
+        """워커 작동 여부에 따라 상태등 색/문구 갱신."""
+        alive = bool(self.worker and self.worker.is_alive())
+        if alive:
+            self.worker_dot.config(text="● 작동중", fg="#117711")
+        else:
+            self.worker_dot.config(text="● 정지 (시작 안 함)", fg="#cc0000")
 
     def load_excel(self):
         path = filedialog.askopenfilename(filetypes=[("Excel/CSV", "*.xlsx *.csv")])
@@ -1606,6 +1642,7 @@ class App(tk.Tk):
         if path:
             self.attach_var.set(path)
             self.attach_pattern[0] = path
+            self._refresh_pdf_border()
 
     def toggle_attach(self):
         self.attach_submit_flag[0] = self.attach_submit_var.get()
@@ -1643,6 +1680,8 @@ class App(tk.Tk):
                 self.v_local.set(st["local"])
             if "progress" in st:
                 self.v_prog.set(st["progress"])
+        self._refresh_worker_dot()
+        self._refresh_pdf_border()
         self.after(200, self.poll_queues)
 
     def _log(self, msg, color=None):
