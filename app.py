@@ -1352,9 +1352,9 @@ class App(tk.Tk):
         self.auto_flag = [True]
         self.addr_flag = [True]
         self.code_flag = [True]           # 확인코드 자동입력 — 기본 켬
-        self.code_confirm_flag = [False]  # 확인(저장)까지 자동 — 기본 끔(이것만 제외)
-        self.autosave_flag = [False]      # 검증 통과 시 임시저장 자동 — 기본 끔(opt-in)
-        self.autoattach_flag = [False]    # 첨부화면 감지 시 자동 업로드 — 기본 끔(opt-in)
+        self.code_confirm_flag = [True]   # 확인(저장)까지 자동 — 기본 켬(완전 자동)
+        self.autosave_flag = [True]       # 검증 통과 시 임시저장 자동 — 기본 켬
+        self.autoattach_flag = [True]     # 첨부화면 감지 시 자동 업로드 — 기본 켬
         _desktop = os.path.join(os.path.expanduser("~"), "Desktop")
         # 첨부 PDF 경로 패턴: {name} 은 신청자명으로 치환됨
         self.attach_pattern = [os.path.join(_desktop, "세종 수소 {name}.pdf")]
@@ -1392,7 +1392,7 @@ class App(tk.Tk):
         self.code_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(bar3, text="확인코드(보안문자) 역순 자동입력", variable=self.code_var,
                         command=self.toggle_code).pack(side="left")
-        self.code_confirm_var = tk.BooleanVar(value=False)
+        self.code_confirm_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(bar3, text="확인까지 자동(=저장 실행)", variable=self.code_confirm_var,
                         command=self.toggle_code).pack(side="left", padx=10)
 
@@ -1402,7 +1402,7 @@ class App(tk.Tk):
         self.tempsave_btn = ttk.Button(bar4, text="💾 임시저장", command=self.manual_tempsave,
                                        state="disabled")
         self.tempsave_btn.pack(side="left")
-        self.autosave_var = tk.BooleanVar(value=False)
+        self.autosave_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(bar4, text="검증 통과 시 임시저장 자동", variable=self.autosave_var,
                         command=self.toggle_autosave).pack(side="left", padx=8)
         ttk.Label(bar4, text="('임시저장' 버튼+확인창만 자동 · 보안코드 [확인]은 위 옵션)",
@@ -1431,7 +1431,7 @@ class App(tk.Tk):
         self.attach_submit_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(arow3, text="팝업 [업로드/저장]까지 자동", variable=self.attach_submit_var,
                         command=self.toggle_attach).pack(side="left", padx=8)
-        self.autoattach_var = tk.BooleanVar(value=False)
+        self.autoattach_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(arow3, text="첨부화면 감지 시 자동 업로드", variable=self.autoattach_var,
                         command=self.toggle_autoattach).pack(side="left", padx=8)
 
