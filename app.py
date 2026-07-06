@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import json
 import difflib
 import threading
 import queue
@@ -46,6 +47,8 @@ FIELDS = [
     {"id": "in_facility_yn",   "kind": "radio",  "required": False, "enum": ["Y", "N"]},
     {"id": "disaster_scrap_yn","kind": "radio",  "required": False, "enum": ["Y", "N"]},
     {"id": "bms_yn",           "kind": "radio",  "required": False, "enum": ["Y", "N"]},
+    {"id": "taxi_yn",          "kind": "radio",  "required": False, "enum": ["Y", "N"]},
+    {"id": "exchange_3year_yn","kind": "radio",  "required": False, "enum": ["Y", "N"]},
     {"id": "priority_type",    "kind": "radio",  "required": False,
      "enum": ["10", "20", "30", "40", "50", "00"]},
     {"id": "contact_nm",       "kind": "text",   "required": False},
@@ -53,7 +56,15 @@ FIELDS = [
     {"id": "seller_mgrid",     "kind": "text",   "required": False},
 ]
 FIELD_BY_ID = {f["id"]: f for f in FIELDS}
-KNOWN_COLS = set(FIELD_BY_ID) | {"local_nm", "car_kind", "addr"}  # local_nm 지자체확인 / car_kind 전기·수소 가드 / addr 주소검색
+# local_nm 지자체확인 / car_kind 전기·수소 가드 / addr 주소검색 /
+# exchange_scrap·exchange_3year_cnt 전환지원금 폐차 정보(특수 처리)
+KNOWN_COLS = set(FIELD_BY_ID) | {"local_nm", "car_kind", "addr",
+                                 "exchange_scrap", "exchange_3year_cnt"}
+
+# 전환지원금 폐차 정보: 라이브 폼의 name 기반 동적 필드 → 한글 라벨(로그·검증용)
+SCRAP_LABELS = {"bf_owner_nm": "직전소유주", "exchg_delivery_day": "차량최초등록일",
+                "own_start_dt": "소유기간시작일", "own_end_dt": "소유기간종료일",
+                "fuel": "유종", "exchg_vh_num": "폐차차량번호"}
 
 # 폼에 원하는 값이 없을 때 대체값 (예: 수소엔 개인사업자(B)가 없어 개인(P)로)
 SELECT_FALLBACK = {"req_kind": {"B": "P"}}
@@ -521,15 +532,167 @@ def verify_fill(driver, row):
     return mismatches
 
 
+# ── 전환지원금 폐차 정보 (동적 name 기반 섹션) ──────────────────
+# 라이브 폼: exchange_3year_yn=Y → '폐차대수'(exchange_3year_cnt) 입력 →
+#   [확인] = create3yearNewCarInfo() 가 '전환지원금 폐차 정보' 행을 생성.
+# 생성된 행 입력칸은 id 가 없고 name 으로만 접근(같은 name 의 숨은 템플릿 존재 →
+#   화면에 '보이는' 요소만 골라 채운다).
+_SCRAP_GEN_JS = r"""
+var cnt = String(arguments[0] || '1');
+var c = document.getElementById('exchange_3year_cnt');
+if(c){ c.value=cnt;
+  c.dispatchEvent(new Event('input',{bubbles:true}));
+  c.dispatchEvent(new Event('change',{bubbles:true})); }
+// create3yearNewCarInfo 가 confirm/alert 를 띄워도 멈추지 않게 잠깐 가로챔
+var _cf=window.confirm, _al=window.alert;
+window.confirm=function(){return true;}; window.alert=function(){};
+try{ create3yearNewCarInfo(); }catch(e){ window.confirm=_cf; window.alert=_al; return 'ERR:'+e; }
+window.confirm=_cf; window.alert=_al;
+return 'ok';
+"""
+
+_SCRAP_VISEL_JS = r"""
+function visEl(name){
+  var els=document.getElementsByName(name);
+  for(var i=0;i<els.length;i++){var e=els[i];var s=getComputedStyle(e);var r=e.getBoundingClientRect();
+    if(!(s.display==='none'||s.visibility==='hidden'||(r.width===0&&r.height===0))) return e;}
+  return els.length?els[0]:null;
+}
+"""
+
+_SCRAP_FILL_JS = _SCRAP_VISEL_JS + r"""
+var data=arguments[0]; var out={};
+function setV(el,v){el.value=v;
+  el.dispatchEvent(new Event('input',{bubbles:true}));
+  el.dispatchEvent(new Event('change',{bubbles:true}));}
+Object.keys(data).forEach(function(name){
+  var val=data[name]; if(val===''||val==null) return;
+  var el=visEl(name); if(!el){ out[name]='NULL'; return; }
+  if((el.tagName||'')==='SELECT'){
+    var matched=false;
+    for(var i=0;i<el.options.length;i++){ if(el.options[i].value===val){el.selectedIndex=i;matched=true;break;} }
+    if(!matched){ for(var j=0;j<el.options.length;j++){ if((el.options[j].text||'').indexOf(val)>=0){el.selectedIndex=j;matched=true;break;} } }
+    el.dispatchEvent(new Event('change',{bubbles:true}));
+    out[name]=el.value;
+  } else { setV(el,val); out[name]=el.value; }
+});
+return JSON.stringify(out);
+"""
+
+_SCRAP_READ_JS = _SCRAP_VISEL_JS + r"""
+var names=arguments[0]; var out={};
+names.forEach(function(n){ var e=visEl(n); out[n]= e? (e.value||'') : ''; });
+return JSON.stringify(out);
+"""
+
+
+def fill_exchange_scrap(driver, row, log=None):
+    """전환지원금 폐차 정보 행을 생성하고 채운다. (exchange_3year_yn=Y 전용)"""
+    scrap = row.get("exchange_scrap") or {}
+    if not scrap:
+        return
+    cnt = str(row.get("exchange_3year_cnt") or "1")
+    try:
+        r = driver.execute_script(_SCRAP_GEN_JS, cnt)
+    except Exception as e:
+        r = "ERR:%s" % e
+    if str(r).startswith("ERR"):
+        if log:
+            log(f"❌ 전환지원금 폐차행 생성 실패({r}) → 폐차대수·확인 직접", color="red")
+        return
+    # 행 등장 대기
+    for _ in range(20):
+        try:
+            if driver.execute_script("return document.getElementsByName('bf_owner_nm').length>0;"):
+                break
+        except Exception:
+            pass
+        time.sleep(0.3)
+    # 채우기(동적 재렌더 대비 재시도)
+    res = {}
+    for _ in range(6):
+        try:
+            res = json.loads(driver.execute_script(_SCRAP_FILL_JS, scrap))
+        except Exception:
+            res = {}
+        if res.get("bf_owner_nm") not in (None, "NULL"):
+            break
+        time.sleep(0.5)
+    nulls = [SCRAP_LABELS.get(k, k) for k, v in res.items() if v == "NULL"]
+    if log:
+        if nulls:
+            log(f"❌ 전환지원금 폐차정보 일부 미입력: {', '.join(nulls)} → 직접 확인", color="red")
+        else:
+            log(f"   ✓ 전환지원금 폐차정보 {len(scrap)}칸 입력 (폐차대수 {cnt})", color="green")
+
+
+def verify_exchange_scrap(driver, row):
+    """폐차 정보 되읽기 대조. 반환: 불일치 [(라벨, 기대, 실제)]."""
+    scrap = row.get("exchange_scrap") or {}
+    if not scrap:
+        return []
+    try:
+        got = json.loads(driver.execute_script(_SCRAP_READ_JS, list(scrap.keys())))
+    except Exception:
+        return [("전환지원금폐차정보", "(읽기실패)", "")]
+    mm = []
+    for k, want in scrap.items():
+        g = str(got.get(k, "") or "")
+        if k in ("exchg_delivery_day", "own_start_dt", "own_end_dt"):
+            ok = re.sub(r"\D", "", g) == re.sub(r"\D", "", str(want))
+        else:
+            ok = g.strip() == str(want).strip()
+        if not ok:
+            mm.append((SCRAP_LABELS.get(k, k), want, g or "(빈칸)"))
+    return mm
+
+
 # ── 첨부파일 업로드 ────────────────────────────────────────────
 # 임시저장 후 뜨는 '지원신청 첨부파일' 페이지의 각 행은
 #   <button onclick="popupAttachFile('<gubun>');return false;">첨부파일 등록</button>
 # 을 가진다. popupAttachFile 은 이름이 'attachFile' 인 팝업을 열고 editForm 을 POST 한다.
-# 자동 입력 대상 3곳(우선순위 증빙자료 A7 제외):
-#   A  = 보조금 구매지원 신청서 + 개인정보 동의서
-#   A2 = 차량 구매계약서
-#   A3 = 개인: 주민등록등본(초본)
-ATTACH_GUBUNS = ["A", "A2", "A3"]
+# 첨부칸 개수는 신청 조건에 따라 다르다(화면에 '보이는' 칸만 필수):
+#   일반   : A(신청서+동의서) / A2(구매계약서) / A3(등본·등기부) = 3곳
+#   전환지원금: 위 3곳 + A7(우선순위증빙) A17(말소사실증명서)
+#              A18(자동차등록원부) A19(가족관계증명서) = 7곳
+# → 하드코딩 대신 visible_attach_gubuns() 로 '지금 보이는' 칸을 자동 감지해 전부 올린다.
+ATTACH_GUBUNS = ["A", "A2", "A3"]   # 감지 실패 시 최소 기본값(폴백)
+
+# A7(우선순위 증빙자료)는 일반 신청에선 제외(마지막 칸), 전환지원금 신청에선 포함.
+#  - 일반   : 보이는 4칸(A·A2·A3·A7) 중 A7 빼고 3곳
+#  - 전환지원금: 보이는 7칸(A·A2·A3·A7·A17·A18·A19) 전부 업로드
+#  전환지원금 여부는 전환지원금 전용 첨부(말소/등록원부/가족관계)의 존재로 판별.
+ATTACH_A7 = "A7"
+EXCHANGE_ATTACH_MARKERS = {"A17", "A18", "A19"}
+
+# 첨부 화면에서 각 칸(gubun)이 어떤 서류인지 (로그·안내용)
+ATTACH_DOC_NAMES = {
+    "A": "신청서+개인정보동의서", "A2": "차량구매계약서", "A3": "주민등록등본/등기부",
+    "A7": "우선순위 증빙자료", "A17": "말소사실증명서", "A18": "자동차 등록원부",
+    "A19": "가족관계증명서",
+}
+
+_VISIBLE_ATTACH_JS = r"""
+var seen={}, out=[];
+document.querySelectorAll('button,a,input[type=button]').forEach(function(b){
+  var oc=(b.getAttribute('onclick')||'');
+  var m=oc.match(/popupAttachFile\('([^']+)'\)/);
+  if(!m) return;
+  var g=m[1]; if(seen[g]) return;
+  var r=b.getBoundingClientRect();
+  if(r.width>0||r.height>0){ seen[g]=1; out.push(g); }
+});
+return out;
+"""
+
+
+def visible_attach_gubuns(driver):
+    """지금 첨부 화면에서 '보이는' 첨부칸 gubun 목록(DOM 순서). 없으면 []"""
+    try:
+        gs = driver.execute_script(_VISIBLE_ATTACH_JS)
+        return [str(g) for g in (gs or [])]
+    except Exception:
+        return []
 
 # 팝업 내부의 업로드/저장 버튼 후보 탐색용 JS
 _ATTACH_POPUP_BTN_JS = r"""
@@ -960,9 +1123,16 @@ class Worker(threading.Thread):
                 # 상세주소는 팝업 후 다시 채움(덮어쓰기 방지)
                 fill_text(self.driver, "addr_detail", row.get("addr_detail"))
 
-        # 4) 되읽기 대조
+        # 3-2) 전환지원금 폐차 정보 (exchange_3year_yn=Y 이고 데이터 있을 때)
+        #   fill_one 에서 exchange_3year_yn 라디오는 이미 Y 로 눌림 → 폐차대수/행 생성/입력
+        if str(row.get("exchange_3year_yn", "") or "").strip() == "Y" and row.get("exchange_scrap"):
+            self.log("전환지원금(폐차 후 전기차) — 폐차 정보 입력…")
+            fill_exchange_scrap(self.driver, row, log=self.log)
+
+        # 4) 되읽기 대조 (일반 필드 + 전환지원금 폐차 정보)
         time.sleep(0.3)
         mm = verify_fill(self.driver, row)
+        mm += verify_exchange_scrap(self.driver, row)
         self.idx += 1
         # 차종(model_cd)은 '가장 비슷한 것'으로 들어가 거의 불일치 → 임시저장 차단에서 제외.
         # (사람이 빨간 경고로 직접 확인하기로 한 항목. 단, 화면엔 그대로 표시함)
@@ -1187,7 +1357,8 @@ class Worker(threading.Thread):
                     self.log(f"[{i}건] ❌ 차종 선택 옵션이 없습니다: '{want}'", color="red")
 
     def do_attach(self):
-        """임시저장 후 첨부 화면에서 현재(직전 입력) 신청자의 PDF를 3곳에 올린다."""
+        """임시저장 후 첨부 화면에서 현재(직전 입력) 신청자의 PDF를
+        '지금 보이는' 첨부칸 전부에 올린다(일반 3곳 / 전환지원금 7곳 자동 감지)."""
         # 직전 입력 건의 신청자명으로 PDF 경로 결정
         ridx = self.idx - 1 if self.idx > 0 else 0
         name = ""
@@ -1204,9 +1375,25 @@ class Worker(threading.Thread):
             self.log(f"⛔ 파일을 못 찾음: {pdf_path} — 파일명/경로를 확인하세요.", color="red")
             self.set_state(status="⛔ 첨부 파일 없음")
             return
+        # 화면에 보이는 첨부칸 자동 감지 (전환지원금이면 7곳으로 늘어남)
+        detected = visible_attach_gubuns(self.driver) or list(ATTACH_GUBUNS)
+        is_exchange = any(g in detected for g in EXCHANGE_ATTACH_MARKERS)
+        if is_exchange:
+            gubuns = list(detected)          # 전환지원금: A7 포함 전부
+            skipped = []
+        else:
+            gubuns = [g for g in detected if g != ATTACH_A7]   # 일반: A7(우선순위 증빙) 제외
+            skipped = [g for g in detected if g == ATTACH_A7]
+        kind = "전환지원금" if is_exchange else "일반"
+        docs = ", ".join("%s(%s)" % (g, ATTACH_DOC_NAMES.get(g, "?")) for g in gubuns)
+        self.log(f"📎 [{kind}] 감지 {len(detected)}곳 → {len(gubuns)}곳 업로드: {docs}")
+        if skipped:
+            sk = ", ".join("%s(%s)" % (g, ATTACH_DOC_NAMES.get(g, "?")) for g in skipped)
+            self.log(f"   ⏭ 제외: {sk} — 우선순위 신청자만 필요")
         submit = bool(self.attach_submit_flag[0])
         try:
-            n = upload_attachments(self.driver, pdf_path, submit=submit, log=self.log)
+            n = upload_attachments(self.driver, pdf_path, gubuns=gubuns,
+                                   submit=submit, log=self.log)
         except Exception as e:
             self.log(f"첨부 오류: {e}", color="red")
             self.set_state(status="첨부 오류 (로그 확인)")
@@ -1424,11 +1611,11 @@ class App(tk.Tk):
                    command=self.pick_attach).pack(side="left")
         arow2 = ttk.Frame(att)
         arow2.pack(fill="x", padx=6, pady=(0, 4))
-        ttk.Label(arow2, text="(파일명의 신청자 자리에 {name} 사용 가능 · 신청서/계약서/등본 3곳, 우선순위증빙 제외)",
+        ttk.Label(arow2, text="(파일명의 신청자 자리에 {name} 사용 가능 · 화면에 보이는 첨부칸 자동감지: 일반 3곳/전환지원금 7곳)",
                   font=("", 8)).pack(side="left")
         arow3 = ttk.Frame(att)
         arow3.pack(fill="x", padx=6, pady=(0, 5))
-        self.attach_btn = ttk.Button(arow3, text="📎 첨부 3곳 올리기", command=self.manual_attach,
+        self.attach_btn = ttk.Button(arow3, text="📎 첨부 올리기(보이는 칸 전부)", command=self.manual_attach,
                                      state="disabled")
         self.attach_btn.pack(side="left")
         self.attach_submit_var = tk.BooleanVar(value=True)

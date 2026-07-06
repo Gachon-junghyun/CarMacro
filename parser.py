@@ -48,6 +48,9 @@ SEX = {"남": "M", "남자": "M", "여": "F", "여자": "F"}
 PRIORITY = {"우선": "10", "우선순위": "10", "법인기관": "20", "법인·기관": "20",
             "중소기업": "30", "택배": "50", "일반": "00"}
 YN = {"Y": "Y", "N": "N", "예": "Y", "아니오": "N", "O": "Y"}
+# 유종 한글 → 라이브 폼 fuel select 코드 (LP=LPG, DS=경유, GS=휘발유)
+FUEL_MAP = {"LPG": "LP", "엘피지": "LP", "액화석유가스": "LP", "LPG(액화석유가스)": "LP",
+            "경유": "DS", "디젤": "DS", "휘발유": "GS", "가솔린": "GS"}
 
 
 def parse_vertical(path):
@@ -268,6 +271,54 @@ def parse_vertical(path):
     if v:
         mapped["seller_mgrid"] = v
 
+    # 택시 여부 (개인택시 등)
+    v, _ = get("택시여부")
+    if v and _norm(v) in YN:
+        mapped["taxi_yn"] = YN[_norm(v)]
+
+    # 생애최초 차량 구매자 여부
+    v, _ = get("생애최초 차량 구매자여부")
+    if not v:
+        v, _ = get("생애최초")
+    if v and _norm(v) in YN:
+        mapped["first_buy_yn"] = YN[_norm(v)]
+
+    # ── 전환지원금(노후 내연기관차 폐차 후 전기차 구매) + 폐차 정보 ──
+    #  라이브 폼: exchange_3year_yn=Y → 폐차대수 입력 → create3yearNewCarInfo() 로
+    #  '전환지원금 폐차 정보' 행이 생성됨. 행 입력칸은 id 없이 name 기반:
+    #  bf_owner_nm/exchg_delivery_day/own_start_dt/own_end_dt/fuel/exchg_vh_num
+    ex_consumed_carno = False
+    v, _ = get("전환지원금")
+    if v and _norm(v) in YN:
+        ex = YN[_norm(v)]
+        mapped["exchange_3year_yn"] = ex
+        if ex == "Y":
+            mapped["exchange_3year_cnt"] = "1"   # 폐차대수(기본 1대)
+            scrap = {}
+            po, _ = get("직전소유주")
+            if po:
+                scrap["bf_owner_nm"] = po
+            fr, _ = get("최초등록일")
+            if not fr:
+                fr, _ = get("차량최초등록일")
+            if fr:
+                scrap["exchg_delivery_day"] = _date_norm(fr)
+            os_, _ = get("소유기간시작일")
+            if os_:
+                scrap["own_start_dt"] = _date_norm(os_)
+            oe, _ = get("소유기간종료일")
+            if oe:
+                scrap["own_end_dt"] = _date_norm(oe)
+            fu, _ = get("유종")
+            if fu:
+                scrap["fuel"] = FUEL_MAP.get(_norm(fu), fu.strip())
+            cn, _ = get("차량번호")
+            if cn:
+                scrap["exchg_vh_num"] = cn.strip()
+                ex_consumed_carno = True   # 전환지원금 폐차차량번호로 소비 → handoff 안 함
+            if scrap:
+                mapped["exchange_scrap"] = scrap
+
     # ── 위험/특수: 사람이 직접 ───────────────────────────────
     for lbl, reason in [
         ("경유화물차 폐차 미이행여부", "대응 필드 불명확 → 직접 선택"),
@@ -275,6 +326,8 @@ def parse_vertical(path):
         ("차대번호", "교체(폐차)차량 섹션 → 직접"),
         ("보유모델명", "교체(폐차)차량 섹션 → 직접"),
     ]:
+        if lbl == "차량번호" and ex_consumed_carno:
+            continue   # 전환지원금 폐차차량번호로 이미 매핑됨
         v, _ = get(lbl)
         if v:
             handoff.append((lbl, v, reason))
