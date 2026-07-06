@@ -658,10 +658,11 @@ def verify_exchange_scrap(driver, row):
 # → 하드코딩 대신 visible_attach_gubuns() 로 '지금 보이는' 칸을 자동 감지해 전부 올린다.
 ATTACH_GUBUNS = ["A", "A2", "A3"]   # 감지 실패 시 최소 기본값(폴백)
 
-# A7(우선순위 증빙자료)는 일반 신청에선 제외(마지막 칸), 전환지원금 신청에선 포함.
+# A7(우선순위 증빙자료)는 '우선순위 대상'(전환지원금·택시)만 첨부, 일반 신청은 제외.
 #  - 일반   : 보이는 4칸(A·A2·A3·A7) 중 A7 빼고 3곳
+#  - 택시   : 보이는 4칸 전부(A7=우선순위 증빙 포함)
 #  - 전환지원금: 보이는 7칸(A·A2·A3·A7·A17·A18·A19) 전부 업로드
-#  전환지원금 여부는 전환지원금 전용 첨부(말소/등록원부/가족관계)의 존재로 판별.
+#  전환지원금 여부는 전용 첨부(말소/등록원부/가족관계) 존재로, 택시는 row taxi_yn 으로 판별.
 ATTACH_A7 = "A7"
 EXCHANGE_ATTACH_MARKERS = {"A17", "A18", "A19"}
 
@@ -1358,12 +1359,11 @@ class Worker(threading.Thread):
 
     def do_attach(self):
         """임시저장 후 첨부 화면에서 현재(직전 입력) 신청자의 PDF를
-        '지금 보이는' 첨부칸 전부에 올린다(일반 3곳 / 전환지원금 7곳 자동 감지)."""
-        # 직전 입력 건의 신청자명으로 PDF 경로 결정
+        '지금 보이는' 첨부칸에 올린다. A7(우선순위 증빙)은 전환지원금·택시 신청자만 포함."""
+        # 직전 입력 건의 신청자 row / 이름
         ridx = self.idx - 1 if self.idx > 0 else 0
-        name = ""
-        if 0 <= ridx < len(self.rows):
-            name = str(self.rows[ridx].get("req_nm", "") or "").strip()
+        row = self.rows[ridx] if 0 <= ridx < len(self.rows) else {}
+        name = str(row.get("req_nm", "") or "").strip()
         pattern = (self.attach_pattern[0] or "").strip()
         if not pattern:
             self.log("⛔ 첨부 PDF 경로(패턴)가 비어 있습니다.", color="red")
@@ -1377,14 +1377,17 @@ class Worker(threading.Thread):
             return
         # 화면에 보이는 첨부칸 자동 감지 (전환지원금이면 7곳으로 늘어남)
         detected = visible_attach_gubuns(self.driver) or list(ATTACH_GUBUNS)
+        # A7(우선순위 증빙자료)은 우선순위 대상만 첨부 → 전환지원금 or 택시 신청자
         is_exchange = any(g in detected for g in EXCHANGE_ATTACH_MARKERS)
-        if is_exchange:
-            gubuns = list(detected)          # 전환지원금: A7 포함 전부
+        is_taxi = str(row.get("taxi_yn", "") or "").strip() == "Y"
+        include_a7 = is_exchange or is_taxi
+        if include_a7:
+            gubuns = list(detected)          # A7 포함 전부
             skipped = []
         else:
-            gubuns = [g for g in detected if g != ATTACH_A7]   # 일반: A7(우선순위 증빙) 제외
+            gubuns = [g for g in detected if g != ATTACH_A7]   # 일반: A7 제외
             skipped = [g for g in detected if g == ATTACH_A7]
-        kind = "전환지원금" if is_exchange else "일반"
+        kind = "전환지원금" if is_exchange else ("택시" if is_taxi else "일반")
         docs = ", ".join("%s(%s)" % (g, ATTACH_DOC_NAMES.get(g, "?")) for g in gubuns)
         self.log(f"📎 [{kind}] 감지 {len(detected)}곳 → {len(gubuns)}곳 업로드: {docs}")
         if skipped:
