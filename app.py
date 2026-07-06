@@ -7,8 +7,9 @@ import threading
 import queue
 import tkinter as tk
 from tkinter import ttk, filedialog
-import pandas as pd
 import openpyxl
+# pandas 는 표형식(CSV/일반 xlsx) 읽기에만 쓰여 무겁고 선택적 → load_excel 에서 지연 import.
+# 실제 워크플로(세로형 양식)는 parser.py(openpyxl)만 사용하므로 exe 에 pandas 불필요.
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import Select
@@ -1688,6 +1689,12 @@ class App(tk.Tk):
             return
         if detect_format(path) == "vertical":
             self.load_vertical(path)
+            return
+        try:
+            import pandas as pd  # 표형식 전용(선택적 의존성)
+        except ImportError:
+            self._log("❌ 표형식(CSV/일반 xlsx)은 pandas가 필요합니다. "
+                      "세로형 양식(신청서_이름.xlsx)을 사용하세요.")
             return
         try:
             df = (pd.read_csv(path, dtype=str) if path.endswith(".csv")
