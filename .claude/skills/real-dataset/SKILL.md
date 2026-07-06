@@ -26,7 +26,8 @@ description: >-
      되도록 스펙에 직접 넣는다.)
 
 3. **스펙 JSON 작성.** 스크래치패드에 `spec.json` 을 쓴다. 한 명이면 객체, 여러 명이면 배열.
-   필드 정의는 [reference/spec_template.json](reference/spec_template.json) 참고. 값 규칙:
+   전체 필드·케이스·사이트 매핑·전환지원금·첨부 규칙은 [reference/FIELD_SPEC.md](reference/FIELD_SPEC.md),
+   빈 템플릿은 [reference/spec_template.json](reference/spec_template.json) 참고. 값 규칙:
    - 날짜는 `YYYY-MM-DD`. 폴더명 `real_MMDD` 는 `contract_day`(계약일자)에서 자동 유추.
    - 이미지에서 `.` 으로 비워둔 칸(전화/이메일 등)은 `.` 그대로 넣는다(필수칸 표시).
    - 개인사업자면 `req_kind:"개인사업자"` + `busi_no`/`busi_nm`.
