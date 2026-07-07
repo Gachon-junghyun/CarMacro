@@ -15,6 +15,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import Select
 
 from parser import parse_vertical
+import browse_control   # 지자체 선택 → 신청서 폼 진입(과부하 재시도) 자동화
 
 URL_SUFFIX = "sellerApplyform"
 
@@ -1235,6 +1236,10 @@ class Worker(threading.Thread):
             try:
                 while True:
                     cmd = self.cmd_q.get_nowait()
+                    if isinstance(cmd, tuple):
+                        if cmd and cmd[0] == "enter":
+                            self.do_enter(*cmd[1:])
+                        continue
                     if cmd == "fill":
                         self.do_fill("수동 입력")
                     elif cmd == "reverify":
@@ -1484,6 +1489,34 @@ class Worker(threading.Thread):
         except Exception:
             return False
 
+    def do_enter(self, car_kind, car_type, local_name):
+        """지자체 선택 → 신청서 작성 폼 진입(과부하 시 재시도). 저장/제출은 안 함.
+        browse_control.enter_form 에 위임하고, 팝업 처리 후 창 핸들/포커스를 재정렬한다."""
+        self.set_state(status="🚪 폼 진입 중… (과부하면 자동 재시도)")
+        try:
+            ok = browse_control.enter_form(
+                self.driver, car_type=car_type, car_kind=car_kind,
+                local_name=(local_name or None), log=self.log)
+        except Exception as e:
+            self.log(f"폼 진입 오류: {e}", color="red")
+            self.set_state(status="폼 진입 오류 (로그 확인)")
+            return
+        finally:
+            # 팝업 열고 닫은 뒤: 메인(폼) 창 재확정 + 알려진 창 목록 갱신
+            try:
+                if self.on_form():
+                    self.main_handle = self.driver.current_window_handle
+                self._known_handles = set(self.driver.window_handles)
+            except Exception:
+                pass
+        if ok:
+            loc = get_value(self.driver, "local_nm")
+            self.log(f"✅ 폼 진입 완료 — 지자체 '{loc or '(미표시)'}'. [▶ 다음 건 입력] 또는 자동입력 대기.")
+            self.set_state(status=f"✅ 폼 진입 완료 (지자체 {loc or '?'})",
+                           local=loc or "(미선택)")
+        else:
+            self.set_state(status="⚠ 폼 진입 미완료 — 로그 확인 후 재시도/직접 진입")
+
     def do_temp_save(self):
         """'임시저장' 버튼을 안전하게 클릭(confirm 자동 수락). 보안코드 팝업은 기존 루프가 처리."""
         if not self.on_form():
@@ -1577,6 +1610,25 @@ class App(tk.Tk):
         self.addr_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(bar2, text="주소 자동검색", variable=self.addr_var,
                         command=self.toggle_addr).pack(side="left")
+
+        # ── 지자체 선택 → 신청서 폼 진입(과부하 재시도) ──
+        # 표시명 → (car_kind, car_type). 전기 11 승용 / 12 화물 / 13 승합, 수소는 단일 폼.
+        self.CARTYPES = {
+            "전기 승용": ("전기", "11"), "전기 화물": ("전기", "12"),
+            "전기 승합": ("전기", "13"), "수소 승용": ("수소", "11"),
+        }
+        bar_enter = ttk.Frame(self)
+        bar_enter.pack(fill="x", padx=10, pady=(0, 4))
+        ttk.Label(bar_enter, text="차종").pack(side="left")
+        self.cartype_var = tk.StringVar(value="전기 승용")
+        ttk.Combobox(bar_enter, textvariable=self.cartype_var, width=8, state="readonly",
+                     values=list(self.CARTYPES)).pack(side="left", padx=(2, 8))
+        ttk.Label(bar_enter, text="지자체").pack(side="left")
+        self.local_var = tk.StringVar(value="")
+        ttk.Entry(bar_enter, textvariable=self.local_var, width=12).pack(side="left", padx=(2, 8))
+        self.enter_btn = ttk.Button(bar_enter, text="🚪 지자체 선택→폼 진입",
+                                    command=self.manual_enter, state="disabled")
+        self.enter_btn.pack(side="left")
 
         bar3 = ttk.Frame(self)
         bar3.pack(fill="x", padx=10, pady=(0, 4))
@@ -1734,6 +1786,8 @@ class App(tk.Tk):
             self.v_prog.set(f"0/{len(rows)}")
         else:
             self.rows, self.valid = rows, True
+            if rows:
+                self._prefill_enter_from_row(rows[0])
             self.start_btn.config(state="normal")
             self._log(f"✅ 검증 통과 ({len(rows)}건"
                       + (f", 경고 {len(warnings)}건" if warnings else "") + "). 시작 가능.")
@@ -1769,10 +1823,26 @@ class App(tk.Tk):
 
         self.rows = [row]
         self.valid = True
+        self._prefill_enter_from_row(row)
         self.start_btn.config(state="normal")
         self.v_status.set("세로형 1건 로드 — 시작 가능 (위 handoff 직접 확인)")
         self.v_prog.set("0/1")
         self._log("✅ 로드 완료. [시작] 후 폼에서 자동 입력됩니다.")
+
+    def _prefill_enter_from_row(self, row):
+        """로드된 건의 지자체/전기·수소를 '폼 진입' 입력칸에 미리 채운다.
+        (승용/화물/승합 세부는 엑셀로 알 수 없어 승용 기본 — 콤보박스로 조정)."""
+        try:
+            loc = str(row.get("local_nm", "") or "").strip()
+            if loc:
+                self.local_var.set(loc)
+            kind = str(row.get("car_kind", "") or "").strip()
+            if kind == "수소":
+                self.cartype_var.set("수소 승용")
+            elif kind == "전기":
+                self.cartype_var.set("전기 승용")
+        except Exception:
+            pass
 
     def start(self):
         if not (self.rows and self.valid):
@@ -1791,6 +1861,7 @@ class App(tk.Tk):
         self.reverify_btn.config(state="normal")
         self.attach_btn.config(state="normal")
         self.tempsave_btn.config(state="normal")
+        self.enter_btn.config(state="normal")
         self._log("워커 시작")
 
     def stop(self):
@@ -1800,11 +1871,23 @@ class App(tk.Tk):
             self.reverify_btn.config(state="disabled")
             self.attach_btn.config(state="disabled")
             self.tempsave_btn.config(state="disabled")
+            self.enter_btn.config(state="disabled")
             self._log("정지 요청")
 
     def manual_fill(self):
         if self.worker and self.worker.is_alive():
             self.cmd_q.put("fill")
+
+    def manual_enter(self):
+        """지자체 선택 → 신청서 폼 진입 요청. 지자체명이 비면 폼 진입만."""
+        if not (self.worker and self.worker.is_alive()):
+            self._log("폼 진입하려면 먼저 [시작] 하세요.")
+            return
+        kind, ctype = self.CARTYPES.get(self.cartype_var.get(), ("전기", "11"))
+        local = self.local_var.get().strip()
+        self.cmd_q.put(("enter", kind, ctype, local))
+        self._log(f"🚪 폼 진입 요청: {self.cartype_var.get()}"
+                  + (f" · 지자체 '{local}'" if local else " · (지자체 미지정 → 폼 진입만)"))
 
     def manual_reverify(self):
         if self.worker and self.worker.is_alive():

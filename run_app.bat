@@ -1,17 +1,35 @@
 @echo off
-REM ── CarMacro 자동입력 앱(GUI) 실행 ──
+REM -- CarMacro 자동입력 앱(GUI) 실행 --
 REM 먼저 run_chrome.bat 로 크롬(포트 9222) 띄우고 ev.or.kr 신청서 폼까지 진입해 두세요.
 
 cd /d "%~dp0"
 
+REM 1) 가상환경(.venv)이 있으면 우선 사용, 없으면 PATH 의 python 사용
 set "PY=%~dp0.venv\Scripts\python.exe"
-if not exist "%PY%" (
-  echo [오류] 가상환경 파이썬을 못 찾았습니다: "%PY%"
-  echo        먼저 아래로 환경을 만드세요:
+if not exist "%PY%" set "PY=python"
+
+REM 2) 파이썬 자체가 있는지 확인
+"%PY%" --version >nul 2>&1
+if errorlevel 1 (
+  echo [오류] 파이썬을 찾지 못했습니다: "%PY%"
+  echo        Python 3.11+ 설치 후 다시 실행하거나, 가상환경을 만드세요:
   echo          python -m venv .venv
   echo          .venv\Scripts\python -m pip install -r requirements.txt
   pause
   exit /b 1
+)
+
+REM 3) 필수 패키지가 있으면 그대로 실행, 없을 때만 설치 시도
+"%PY%" -c "import openpyxl, selenium" >nul 2>&1
+if errorlevel 1 (
+  echo [안내] 필요한 패키지가 없어 설치를 시도합니다...
+  "%PY%" -m pip install -r requirements.txt
+  if errorlevel 1 (
+    echo [오류] 자동 설치 실패. 직접 실행하세요:
+    echo          "%PY%" -m pip install -r requirements.txt
+    pause
+    exit /b 1
+  )
 )
 
 "%PY%" app.py

@@ -18,6 +18,8 @@ h2.json
 # ⚠ 실제 신청자 개인정보(절대 커밋 금지): 실전 데이터/생성 스크립트/라이브 덤프
 real_0701/
 real_*/
+# 루트의 real_* 파일도 차단(예: real_0707.zip) — 위 폴더 패턴은 파일을 못 거름
+/real_*
 make_0701.py
 make_0701_tabular.py
 tools/_attach_dump.html
