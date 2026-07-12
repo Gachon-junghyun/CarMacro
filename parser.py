@@ -44,6 +44,8 @@ def _birth6(v):
 # 값 변환 사전 (정규화된 한글 → site 코드)
 MOBILE_RE = re.compile(r"01[016789]-?\d{3,4}-?\d{4}")
 REQ_KIND = {"개인": "P", "개인사업자": "B", "단체": "G"}
+# 단체 신청구분(grp_reqst_se): 공공기관 01 / 지자체 02 / 기타 99
+GRP_REQST = {"공공기관": "01", "지자체": "02", "기타": "99"}
 SEX = {"남": "M", "남자": "M", "여": "F", "여자": "F"}
 PRIORITY = {"우선": "10", "우선순위": "10", "법인기관": "20", "법인·기관": "20",
             "중소기업": "30", "택배": "50", "일반": "00"}
@@ -169,6 +171,29 @@ def parse_vertical(path):
     if v:
         mapped["pri_busi_nm"] = v
 
+    # ── 단체(법인·기관) 전용 라벨 → 폼 필드 id 매핑 ──
+    #  단체 폼은 같은 칸 id 가 개인과 다른 뜻을 가진다:
+    #    req_nm=기관명(개인은 성명) · ceo=대표자 · birth2=법인등록번호(개인은 주민번호)
+    v, _ = get("기관명")
+    if v:
+        mapped["req_nm"] = v            # 단체: 기관명이 성명(req_nm) 칸에 들어감
+    v, _ = get("대표자")
+    if v:
+        mapped["ceo"] = v
+    v, _ = get("법인등록번호")
+    if v:
+        mapped["birth2"] = v            # 단체: 법인등록번호는 birth2 칸
+    v, _ = get("신청구분")
+    if v:
+        code = GRP_REQST.get(_norm(v))
+        if code:
+            mapped["grp_reqst_se"] = code
+        else:
+            handoff.append(("신청구분", v, "grp_reqst_se 매칭 실패"))
+    v, _ = get("개인사업장명")   # 단체 폼의 사업자명 라벨
+    if v:
+        mapped["pri_busi_nm"] = v
+
     # 신청차종 → 라이브 옵션 텍스트 매칭 필요
     v, _ = get("신청차종")
     if v:
@@ -276,6 +301,16 @@ def parse_vertical(path):
     if v and _norm(v) in YN:
         mapped["taxi_yn"] = YN[_norm(v)]
 
+    # ── 전기 화물(car_type=12) 전용 항목 ──
+    # 농업인 여부
+    v, _ = get("농업인여부")
+    if v and _norm(v) in YN:
+        mapped["farmng_yn"] = YN[_norm(v)]
+    # 택배여부
+    v, _ = get("택배여부")
+    if v and _norm(v) in YN:
+        mapped["hdry_yn"] = YN[_norm(v)]
+
     # 생애최초 차량 구매자 여부
     v, _ = get("생애최초 차량 구매자여부")
     if not v:
@@ -319,18 +354,31 @@ def parse_vertical(path):
             if scrap:
                 mapped["exchange_scrap"] = scrap
 
-    # ── 위험/특수: 사람이 직접 ───────────────────────────────
-    for lbl, reason in [
-        ("경유화물차 폐차 미이행여부", "대응 필드 불명확 → 직접 선택"),
-        ("차량번호", "교체(폐차)차량 섹션 → 직접"),
-        ("차대번호", "교체(폐차)차량 섹션 → 직접"),
-        ("보유모델명", "교체(폐차)차량 섹션 → 직접"),
-    ]:
-        if lbl == "차량번호" and ex_consumed_carno:
-            continue   # 전환지원금 폐차차량번호로 이미 매핑됨
-        v, _ = get(lbl)
-        if v:
-            handoff.append((lbl, v, reason))
+    # ── 경유화물차 보유 미이행자 정보 (thrgh_ex_yn=Y → 보유차량 동적행) ──
+    #   라이브 폼: thrgh_ex_yn=Y → 보유대수(thrgh_ex_cnt) → createNewCarInfoHold() 로 행 생성.
+    #   생성칸(name): ex_vh_num_hold(차량번호)/ex_vh_id_hold(차대번호)/ex_model_nm_hold(보유모델명)
+    v, _ = get("경유화물차 폐차 미이행여부")
+    if not v:
+        v, _ = get("경유화물차 미이행자 여부")
+    if v and _norm(v) in YN:
+        thy = YN[_norm(v)]
+        mapped["thrgh_ex_yn"] = thy
+        if thy == "Y":
+            mapped["thrgh_ex_cnt"] = "1"   # 보유대수(기본 1대)
+            hold = {}
+            cn, _ = get("차량번호")   # 보유차량번호(전환지원금 폐차차량번호로 이미 소비됐으면 제외)
+            if cn and not ex_consumed_carno:
+                hold["ex_vh_num_hold"] = cn.strip()
+            vin, _ = get("차대번호")
+            if not vin:
+                vin, _ = get("보유차대번호")
+            if vin:
+                hold["ex_vh_id_hold"] = vin.strip()
+            hm, _ = get("보유모델명")
+            if hm:
+                hold["ex_model_nm_hold"] = hm.strip()
+            if hold:
+                mapped["thrgh_hold"] = hold
 
     # 암호 역순
     handoff.append(("암호 역순 입력", "제출 직전 단계", "캡차성 단계 → 사람이 직접 (자동화 안 함)"))

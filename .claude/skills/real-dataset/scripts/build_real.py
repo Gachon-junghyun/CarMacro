@@ -15,10 +15,14 @@ examples/real_sample_ev.xlsx 와 동일한 2D 그리드 배치로 저장하며,
   contract_day   계약일자         req_kind  "개인"|"개인사업자"|"단체"
   name 성명       birth 생년월일    sex 성별("남"/"여")
   busi_no 사업자번호   busi_nm 사업자명   (개인사업자일 때)
+  # 단체(법인·기관) 전용:
+  org_nm 기관명   ceo 대표자   corp_no 법인등록번호   grp_reqst_se 신청구분("공공기관"|"지자체"|"기타")
+    (org_nm 생략 시 name 을 기관명으로, busi_nm 을 개인사업장명으로 사용. name 은 파일명에도 쓰임)
   model 신청차종  cnt 신청대수   delivery 출고예정일자   subsidy 보조금금액
   addr 주소       addr_detail 이하주소(상세)
   phone 전화번호  mobile 신청자휴대폰(라벨없이 입력)  email 이메일
   taxi_yn 택시여부   first_buy_yn 생애최초차량구매자여부   social_yn 사회계층여부   social_kind 사회계층유형
+  farmng_yn 농업인여부   hdry_yn 택배여부   (전기 화물 car_type=12 전용)
   exchange_yn 전환지원금(Y/N)  prev_owner 직전소유주  first_reg 차량최초등록일
     own_start 소유기간시작일  own_end 소유기간종료일  fuel 유종(LPG/경유/휘발유)
     scrap_car_no (전환지원금)폐차 차량번호
@@ -66,11 +70,19 @@ def build_workbook(spec):
         [("구분", gubun)],
         [("계약일자", g("contract_day"))],
         [("신청유형", g("req_kind"))],
-        [("성명", g("name")), ("생년월일", g("birth")), ("성별", g("sex"))],
     ]
-    if g("req_kind") == "개인사업자" or g("busi_no") or g("busi_nm"):
-        lines.append([("개인사업자", None), ("사업자번호", g("busi_no")),
-                      ("사업자명", g("busi_nm"))])
+    if str(g("req_kind") or "").strip() == "단체":
+        # 단체(법인·기관): 개인 폼과 칸 구성이 다름 → 기관명/대표자/법인등록번호/신청구분
+        if g("grp_reqst_se"):
+            lines.append([("신청구분", g("grp_reqst_se"))])   # 공공기관/지자체/기타
+        lines.append([("기관명", g("org_nm") or g("name")), ("대표자", g("ceo"))])
+        lines.append([("법인등록번호", g("corp_no")), ("사업자번호", g("busi_no")),
+                      ("개인사업장명", g("busi_nm") or g("org_nm") or g("name"))])
+    else:
+        lines.append([("성명", g("name")), ("생년월일", g("birth")), ("성별", g("sex"))])
+        if g("req_kind") == "개인사업자" or g("busi_no") or g("busi_nm"):
+            lines.append([("개인사업자", None), ("사업자번호", g("busi_no")),
+                          ("사업자명", g("busi_nm"))])
     lines.append([("신청차종", g("model")), ("신청대수", g("cnt")),
                   ("출고예정일자", g("delivery"))])
     if g("subsidy"):
@@ -82,8 +94,13 @@ def build_workbook(spec):
     if g("first_buy_yn"):
         lines.append([("생애최초 차량 구매자여부", g("first_buy_yn"))])
     if g("taxi_yn") or g("social_yn") or g("social_kind"):
+        # 사회계층유형(소상공인 등)은 두 번째 '사회계층여부' 라벨 오른쪽에 둔다.
+        # (parser 는 라벨 바로 오른쪽 셀만 값으로 읽으므로, 라벨 없는 칸에 두면 유실됨)
         lines.append([("택시여부", g("taxi_yn")), ("사회계층여부", g("social_yn")),
-                      (None, g("social_kind"))])
+                      ("사회계층여부", g("social_kind"))])
+    # 전기 화물(car_type=12) 전용: 농업인 여부 · 택배여부
+    if g("farmng_yn") or g("hdry_yn"):
+        lines.append([("농업인여부", g("farmng_yn")), ("택배여부", g("hdry_yn"))])
     # 전환지원금(노후 내연기관차 폐차 후 전기차 구매) — 폐차 정보 포함
     if g("exchange_yn"):
         lines.append([("전환지원금", g("exchange_yn")), ("사회계층여부", g("social_yn"))])
